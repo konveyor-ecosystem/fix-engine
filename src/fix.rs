@@ -241,6 +241,13 @@ pub struct FixStrategyEntry {
     /// Dependency update: new version range (e.g., "^6.1.0").
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub new_version: Option<String>,
+    /// Dependency update: old package coordinate for proactive matching.
+    /// When set, the fix engine can search manifest files for this coordinate
+    /// even without kantra incidents (bypassing the kantra dependency dispatch).
+    /// For namespace migrations: the old namespace (e.g., "javax.persistence").
+    /// For coordinate renames: the old group:artifact (e.g., "org.hibernate:hibernate-core").
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub old_package: Option<String>,
 
     // ── Family migration fields ────────────────────────────────────────
     // Used by `FamilyMigration` strategy entries (keyed `family:<Name>`)
@@ -375,6 +382,24 @@ impl FixStrategyEntry {
         }
     }
 
+    /// Create an EnsureDependency strategy with old_package for proactive matching.
+    ///
+    /// `old_package` is used by the fix engine to search manifest files when
+    /// kantra doesn't produce incidents for dependency conditions.
+    pub fn ensure_dependency_with_old(
+        package: impl Into<String>,
+        new_version: impl Into<String>,
+        old_package: impl Into<String>,
+    ) -> Self {
+        Self {
+            strategy: "EnsureDependency".into(),
+            package: Some(package.into()),
+            new_version: Some(new_version.into()),
+            old_package: Some(old_package.into()),
+            ..Default::default()
+        }
+    }
+
     /// Convert to a MappingEntry (extracting the single mapping).
     pub fn to_mapping(&self) -> MappingEntry {
         MappingEntry {
@@ -420,6 +445,7 @@ pub fn strategy_priority(strategy: &str) -> u8 {
         "Rename" => 5,
         "RemoveProp" => 4,
         "CssVariablePrefix" => 4,
+        "AnnotationParamRewrite" => 4,
         "ImportPathChange" => 3,
         "PropValueChange" => 2,
         "PropTypeChange" => 2,
