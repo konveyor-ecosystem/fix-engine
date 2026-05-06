@@ -349,6 +349,7 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
                         &printer,
                         opts.goose_timeout,
                         opts.goose_max_families,
+                        &project,
                     );
 
                     let succeeded = results.iter().filter(|r| r.success).count();

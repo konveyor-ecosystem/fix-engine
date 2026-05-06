@@ -38,6 +38,7 @@ fn run_goose_with_timeout(
     prompt: &str,
     max_turns: &str,
     timeout_secs: u64,
+    project_dir: &std::path::Path,
 ) -> Result<(bool, String, String)> {
     #[cfg(unix)]
     let pty = nix::pty::openpty(None, None)
@@ -59,6 +60,8 @@ fn run_goose_with_timeout(
         "--output-format",
         "json",
     ])
+    .current_dir(project_dir)
+    .env("GOOSE_WORKING_DIR", project_dir)
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped())
     .stdin(std::process::Stdio::null());
@@ -328,6 +331,7 @@ pub fn run_all_goose_fixes(
     printer: &crate::progress::ProgressPrinter,
     timeout_secs: u64,
     max_families_per_chunk: usize,
+    project_dir: &std::path::Path,
 ) -> Vec<GooseFixResult> {
     // Create log directory if specified, removing stale logs from
     // previous runs. Without cleanup, errored files (which previously
@@ -460,6 +464,7 @@ pub fn run_all_goose_fixes(
                     log_dir,
                     timeout_secs,
                     max_families_per_chunk,
+                    project_dir,
                 );
 
                 if i == 0 {
@@ -529,6 +534,7 @@ fn process_single_file(
     log_dir: Option<&std::path::Path>,
     timeout_secs: u64,
     max_families_per_chunk: usize,
+    project_dir: &std::path::Path,
 ) -> (GooseFixResult, Vec<String>) {
     let mut log: Vec<String> = Vec::new();
 
@@ -581,7 +587,7 @@ fn process_single_file(
         let prompt = build_merged_prompt(&file_requests[0], ctx);
         all_prompts.push(prompt.clone());
         let max_turns_str = "5".to_string();
-        let mut goose_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs);
+        let mut goose_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs, project_dir);
         let mut was_retried = false;
         // Retry once on empty response
         if let Ok((_, ref output, _)) = goose_result {
@@ -589,7 +595,7 @@ fn process_single_file(
                 was_retried = true;
                 log.push(format!("         {}: empty response — retrying once...", file_name));
                 std::thread::sleep(Duration::from_secs(2));
-                goose_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs);
+                goose_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs, project_dir);
             }
         }
         match goose_result {
@@ -701,7 +707,7 @@ fn process_single_file(
             let max_turns = (22 + chunk.len()).min(40);
             let max_turns_str = max_turns.to_string();
             let chunk_start = std::time::Instant::now();
-            let mut chunk_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs);
+            let mut chunk_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs, project_dir);
             let mut was_retried = false;
 
             // Retry once on empty response. Goose sometimes returns an
@@ -728,7 +734,7 @@ fn process_single_file(
                          just because some are — check EVERY one.",
                         prompt,
                     );
-                    chunk_result = run_goose_with_timeout(&retry_prompt, &max_turns_str, timeout_secs);
+                    chunk_result = run_goose_with_timeout(&retry_prompt, &max_turns_str, timeout_secs, project_dir);
                 }
             }
 
@@ -875,7 +881,7 @@ fn process_single_file(
                         ));
                         std::thread::sleep(backoff);
                         let _retry_start = std::time::Instant::now();
-                        let retry_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs);
+                        let retry_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs, project_dir);
                         match retry_result {
                             Ok((success, output, _retry_stderr)) => {
                                 for req in chunk.iter() {
