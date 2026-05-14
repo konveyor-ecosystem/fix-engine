@@ -137,6 +137,16 @@ pub struct DeprecatedMigrationContext {
     /// Props that exist ONLY on the deprecated component (no v6 equivalent).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub removed_props: Vec<String>,
+    /// Appearance/variant notes inferred from CSS modifier comparison.
+    ///
+    /// When the replacement component has a variant-like prop (e.g., `variant`)
+    /// with union string values, and the deprecated component's CSS modifiers
+    /// suggest a specific default appearance, this field provides guidance.
+    ///
+    /// Example: "Chip has no pf-m-outline modifier (outline is its default
+    /// appearance). Add variant='outline' to Label to preserve visual parity."
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub appearance_notes: Vec<String>,
 }
 
 /// A machine-readable fix strategy entry.
