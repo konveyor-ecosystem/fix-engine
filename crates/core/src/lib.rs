@@ -321,6 +321,29 @@ pub enum FixStrategy {
     EnsureDependency {
         package: String,
         new_version: String,
+        /// Original package name/coordinate to search for when running proactively
+        /// (i.e., when kantra didn't fire any incidents for this rule).
+        old_package: Option<String>,
+    },
+    /// Java-specific import + class rename. Replaces the import statement
+    /// and does word-boundary-aware replacement of the class name throughout
+    /// the file. Safer than generic `Rename` for Java code because it won't
+    /// match substrings of unrelated identifiers.
+    JavaImportRename {
+        old_fqn: String,
+        new_fqn: String,
+    },
+    /// Java annotation parameter rewrite: changes an annotation's element name
+    /// and optionally transforms its value. For example:
+    /// `@Type(type = "com.example.Foo")` → `@Type(value = Foo.class)`
+    ///
+    /// `value_transform`: how to convert the old value to the new one.
+    /// - `"StringFqnToClassLiteral"`: `"com.example.Foo"` → `Foo.class` (adds import)
+    /// - `"Identity"`: keep the value as-is, just rename the param
+    AnnotationParamRewrite {
+        old_param: String,
+        new_param: String,
+        value_transform: String,
     },
     /// No auto-fix available -- flag for manual review.
     Manual,
@@ -391,6 +414,7 @@ pub fn strategy_entry_to_fix_strategy(entry: &FixStrategyEntry) -> FixStrategy {
                 FixStrategy::EnsureDependency {
                     package: package.clone(),
                     new_version: new_version.clone(),
+                    old_package: entry.old_package.clone(),
                 }
             } else {
                 FixStrategy::Manual
@@ -416,6 +440,68 @@ pub fn strategy_entry_to_fix_strategy(entry: &FixStrategyEntry) -> FixStrategy {
         "FamilyMigration" => FixStrategy::Llm {
             context: Some(format_family_migration_context(entry)),
         },
+        // Java import + class rename: replaces import statement and
+        // does word-boundary-aware class name replacement throughout the file.
+        "JavaImportRename" => {
+            if let (Some(from), Some(to)) = (&entry.from, &entry.to) {
+                FixStrategy::JavaImportRename {
+                    old_fqn: from.clone(),
+                    new_fqn: to.clone(),
+                }
+            } else {
+                FixStrategy::Manual
+            }
+        }
+        // Java annotation parameter rewrite: e.g., @Type(type = "fqn") → @Type(value = Cls.class)
+        "AnnotationParamRewrite" => {
+            if let (Some(from), Some(to)) = (&entry.from, &entry.to) {
+                // from = old param name (e.g., "type"), to = new param name (e.g., "value")
+                // value_transform is stored in the `replacement` field
+                let transform = entry
+                    .replacement
+                    .as_deref()
+                    .unwrap_or("StringFqnToClassLiteral")
+                    .to_string();
+                FixStrategy::AnnotationParamRewrite {
+                    old_param: from.clone(),
+                    new_param: to.clone(),
+                    value_transform: transform,
+                }
+            } else {
+                FixStrategy::Llm {
+                    context: Some(format_strategy_context(entry)),
+                }
+            }
+        }
+        // Java-specific strategies from semver-analyzer
+        "UpdateType" => {
+            // Simple single-word type swaps (e.g., Serializable → Object) can
+            // use mechanical rename. Complex types go to LLM.
+            if let (Some(from), Some(to)) = (&entry.from, &entry.to) {
+                if !from.contains(' ') && !to.contains(' ') && !from.contains('<') {
+                    FixStrategy::Rename(vec![RenameMapping {
+                        old: from.clone(),
+                        new: to.clone(),
+                    }])
+                } else {
+                    FixStrategy::Llm {
+                        context: Some(format_strategy_context(entry)),
+                    }
+                }
+            } else {
+                FixStrategy::Manual
+            }
+        }
+        "UpdateSignature" => FixStrategy::Llm {
+            context: Some(format_strategy_context(entry)),
+        },
+        // Bulk constant/token group from semver-analyzer.  The individual
+        // constants may have been collapsed into a single combined rule.
+        // Route to LLM so it can apply per-symbol fixes from the message.
+        "ConstantGroup" => FixStrategy::Llm {
+            context: Some(format_strategy_context(entry)),
+        },
+        "ManualReview" => FixStrategy::Manual,
         _ => FixStrategy::Manual,
     }
 }
@@ -657,6 +743,52 @@ pub fn load_strategies_and_families(
     Ok((strategies, families))
 }
 
+/// Check if an LLM violation is still fresh by comparing its code_snip
+/// against the current file content. Returns `true` if the violation
+/// appears to still apply, `false` if it looks stale (already fixed).
+///
+/// Used to filter out violations that were resolved by the pattern-fix
+/// phase before sending to the LLM.
+pub fn is_violation_fresh(
+    code_snip: Option<&str>,
+    line: u32,
+    current_content: &str,
+) -> bool {
+    let snip = match code_snip {
+        Some(s) => s,
+        None => return true, // no snippet to compare — assume fresh
+    };
+
+    let target_prefix = format!("{}", line);
+    let key_text = snip
+        .lines()
+        .find(|l| {
+            let trimmed = l.trim_start();
+            trimmed.starts_with(&target_prefix)
+                && trimmed[target_prefix.len()..]
+                    .starts_with(|c: char| !c.is_ascii_digit())
+        })
+        .map(|l| {
+            let trimmed = l.trim_start();
+            let after_num = &trimmed[target_prefix.len()..];
+            after_num.trim().to_string()
+        });
+
+    let key = match key_text {
+        Some(ref k) if k.len() > 5 => k,
+        _ => return true, // snippet too short to compare — assume fresh
+    };
+
+    let lines: Vec<&str> = current_content.lines().collect();
+    let start = (line as usize).saturating_sub(6);
+    let end = ((line as usize) + 5).min(lines.len());
+    if start >= lines.len() {
+        return true; // file shorter than expected — assume fresh
+    }
+    let window = &lines[start..end];
+    window.iter().any(|l| l.trim() == key.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,6 +929,7 @@ mod tests {
             FixStrategy::EnsureDependency {
                 package,
                 new_version,
+                ..
             } => {
                 assert_eq!(package, "@patternfly/react-core");
                 assert_eq!(new_version, "^6.0.0");
@@ -907,5 +1040,93 @@ mod tests {
         assert_eq!(entry.mappings.len(), 2);
         assert_eq!(entry.mappings[0].from.as_deref(), Some("Chip"));
         assert_eq!(entry.mappings[0].to.as_deref(), Some("Label"));
+    }
+
+    /// Fix 13: is_violation_fresh should return false when the code snippet
+    /// text no longer exists at the expected line in the current file.
+    #[test]
+    fn test_violation_fresh_when_code_matches() {
+        let snip = "    8        <AccordionItem>\n    9          <AccordionToggle isExpanded={expanded}>\n   10            Item One";
+        let content = "import React from 'react';\n\nconst App = () => (\n  <Accordion>\n    <AccordionItem>\n      <AccordionToggle isExpanded={expanded}>\n        Item One\n      </AccordionToggle>\n    </AccordionItem>\n  </Accordion>\n);";
+
+        // Line 9 text exists in the content near line 9 → fresh
+        assert!(
+            is_violation_fresh(Some(snip), 9, content),
+            "Should be fresh when code snippet matches current file"
+        );
+    }
+
+    #[test]
+    fn test_violation_stale_when_code_changed() {
+        let snip = "    8        <AccordionItem>\n    9          <AccordionToggle isExpanded={expanded}>\n   10            Item One";
+        // The isExpanded prop was removed by pattern fix
+        let content = "import React from 'react';\n\nconst App = () => (\n  <Accordion>\n    <AccordionItem>\n      <AccordionToggle>\n        Item One\n      </AccordionToggle>\n    </AccordionItem>\n  </Accordion>\n);";
+
+        // Line 9 text no longer matches → stale
+        assert!(
+            !is_violation_fresh(Some(snip), 9, content),
+            "Should be stale when code snippet no longer matches"
+        );
+    }
+
+    #[test]
+    fn test_violation_fresh_no_snippet() {
+        assert!(
+            is_violation_fresh(None, 5, "any content"),
+            "No snippet → assume fresh"
+        );
+    }
+
+    #[test]
+    fn test_violation_fresh_short_snippet() {
+        // Snippet line text too short (<=5 chars) → assume fresh
+        let snip = "    9  x";
+        assert!(
+            is_violation_fresh(Some(snip), 9, "anything"),
+            "Short snippet text → assume fresh"
+        );
+    }
+
+    /// Demonstrates the false positive in `is_violation_fresh` when a
+    /// pattern fix for one rule modifies the same line that an LLM
+    /// violation targets for a different rule.
+    ///
+    /// In this scenario the absorbing-prop rule fires on line 8
+    /// (`<NavItem to="#" hasNavLinkWrapper>`).  A separate RemoveProp
+    /// pattern fix removes `hasNavLinkWrapper`, changing line 8 to
+    /// `<NavItem to="#">`.  The stale-violation filter then sees that
+    /// line 8's text no longer matches and incorrectly drops the
+    /// absorbing-prop LLM request.
+    ///
+    /// The fix for this is in `fix.rs`: co-located pattern fixes are
+    /// promoted to `pending_llm` so the line is never modified before
+    /// the stale check runs.
+    #[test]
+    fn test_violation_appears_stale_when_different_fix_modifies_same_line() {
+        let snip = "    7      <NavList>\n\
+                        8        <NavItem to=\"#\" hasNavLinkWrapper>\n\
+                        9          <HomeIcon /> Home";
+        // After a RemoveProp pattern fix removed hasNavLinkWrapper from line 8
+        let content = "import React from 'react';\n\
+                       import { Nav, NavItem, NavList } from '@patternfly/react-core';\n\
+                       import { HomeIcon } from '@patternfly/react-icons';\n\
+                       \n\
+                       const App = () => (\n\
+                         <Nav>\n\
+                           <NavList>\n\
+                             <NavItem to=\"#\">\n\
+                               <HomeIcon /> Home\n\
+                             </NavItem>\n\
+                           </NavList>\n\
+                         </Nav>\n\
+                       );";
+        // is_violation_fresh returns false because the exact line text
+        // changed — even though the NavItem component is still present
+        // and the absorbing-prop violation is still relevant.
+        assert!(
+            !is_violation_fresh(Some(snip), 8, content),
+            "Demonstrates false positive: line was modified by a different fix, \
+             not because this violation was resolved"
+        );
     }
 }

@@ -1,12 +1,14 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
 use fix_engine_core::FixSource;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use fix_engine::engine;
 use fix_engine::goose_client;
 use fix_engine::llm_client;
 use fix_engine::registry::FixContextRegistry;
+use fix_engine_java_fix::JavaFixProvider;
 use fix_engine_js_fix::JsFixProvider;
 
 /// LLM provider for AI-assisted fixes.
@@ -40,10 +42,27 @@ pub enum ColorMode {
     Never,
 }
 
+/// Target language for language-specific fix operations.
+#[derive(Debug, Clone, Default, ValueEnum)]
+pub enum Language {
+    /// JavaScript / TypeScript / JSX / TSX (default).
+    #[default]
+    Js,
+    /// Java.
+    Java,
+}
+
 #[derive(Args)]
 pub struct FixOpts {
     /// Path to the project to fix.
     pub project: PathBuf,
+
+    /// Target language for language-specific fix operations.
+    ///
+    /// Selects the appropriate language provider for syntax-aware operations
+    /// like import deduplication, attribute removal, and dependency management.
+    #[arg(long, value_enum, default_value_t)]
+    pub language: Language,
 
     /// Path to Konveyor analysis output (YAML or JSON).
     #[arg(short, long)]
@@ -104,6 +123,28 @@ pub struct FixOpts {
     /// against this limit.
     #[arg(long, default_value_t = 2)]
     pub goose_max_families: usize,
+
+    /// Only process violations in the listed files. Accepts either:
+    /// - A timeouts.json file produced by a previous run (extracts files
+    ///   from the "timed_out" and "failed" arrays)
+    /// - A plain text file with one file path or file:// URI per line
+    ///
+    /// All other violations are ignored. Useful for retrying timed-out
+    /// files with a larger --goose-timeout.
+    #[arg(long)]
+    pub only_files: Option<PathBuf>,
+
+    /// Command to run tests for companion test files after the LLM applies
+    /// fixes. The placeholder `{test_file}` is replaced with the test file
+    /// path. When set, the LLM prompt instructs the model to run the test,
+    /// read any failures, and iterate on fixes.
+    ///
+    /// Can also be set via `FIX_ENGINE_TEST_COMMAND` environment variable.
+    /// The CLI flag takes precedence over the environment variable.
+    ///
+    /// Example: --test-command "npx jest --testPathPattern={test_file} --no-coverage --forceExit"
+    #[arg(long, env = "FIX_ENGINE_TEST_COMMAND")]
+    pub test_command: Option<String>,
 }
 
 pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) -> Result<()> {
@@ -116,7 +157,7 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
     let phase = progress.start_phase("Loading analysis output...");
     let input_content = std::fs::read_to_string(&opts.input)?;
 
-    let output: Vec<konveyor_core::report::RuleSet> = {
+    let mut output: Vec<konveyor_core::report::RuleSet> = {
         let trimmed = input_content.trim_start();
         if trimmed.starts_with('[') || trimmed.starts_with('{') {
             serde_json::from_str(&input_content)?
@@ -124,6 +165,37 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
             yaml_serde::from_str::<Vec<konveyor_core::report::RuleSet>>(&input_content)?
         }
     };
+
+    // ── Filter by --only-files if specified ───────────────────────────
+    if let Some(ref only_files_path) = opts.only_files {
+        let file_filter = parse_only_files(only_files_path)
+            .with_context(|| format!("Failed to parse --only-files: {}", only_files_path.display()))?;
+        let before_incidents: usize = output
+            .iter()
+            .flat_map(|rs| rs.violations.values())
+            .map(|v| v.incidents.len())
+            .sum();
+
+        for rs in &mut output {
+            for violation in rs.violations.values_mut() {
+                violation.incidents.retain(|inc| file_filter.matches(&inc.file_uri));
+            }
+            // Drop violations that have no remaining incidents.
+            rs.violations.retain(|_, v| !v.incidents.is_empty());
+        }
+
+        let after_incidents: usize = output
+            .iter()
+            .flat_map(|rs| rs.violations.values())
+            .map(|v| v.incidents.len())
+            .sum();
+        progress.println(&format!(
+            "  Filtered to {} files ({} -> {} incidents)",
+            file_filter.len(),
+            before_incidents,
+            after_incidents,
+        ));
+    }
 
     let context_registry = FixContextRegistry::new();
     let ruleset_name = output.first().map(|rs| rs.name.as_str()).unwrap_or("");
@@ -212,11 +284,24 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
     }
 
     // ── Plan fixes ───────────────────────────────────────────────────
-    let lang = JsFixProvider::new();
+    let lang: Box<dyn fix_engine::language::LanguageFixProvider> = match opts.language {
+        Language::Js => Box::new(JsFixProvider::new()),
+        Language::Java => Box::new(JavaFixProvider::new()),
+    };
     let mut report = fix_engine_core::FixReport::new();
 
     let phase = progress.start_phase("Planning fixes...");
-    let mut plan = engine::plan_fixes(&output, &project, &merged_strategies, &lang, &mut report)?;
+    let mut plan = engine::plan_fixes(&output, &project, &merged_strategies, lang.as_ref(), &mut report)?;
+
+    // Enrich cross-package EnsureDependency requests with family labels.
+    // This bridges requests from one package's analysis (e.g., react-core saying
+    // "add react-drag-drop") to family entries from the target package's analysis
+    // (e.g., family:DragDrop with DragDropSort composition info).
+    engine::enrich_cross_package_requests(
+        &mut plan.pending_llm,
+        &merged_strategies,
+        &family_entries,
+    );
 
     // Consolidate family-grouped LLM requests.
     let mut consolidated_count = 0;
@@ -236,6 +321,105 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
             test_fix_requests.len(),
         ));
         plan.pending_llm.extend(test_fix_requests);
+    }
+
+    // ── Promote co-located pattern fixes to LLM ────────────────────
+    //
+    // When a deterministic pattern fix and an LLM fix target the same
+    // (file, line), the pattern fix would modify the line first, causing
+    // the stale-violation filter to incorrectly drop the LLM fix (the
+    // code snippet no longer matches the post-edit line).  Instead,
+    // promote the pattern fix into pending_llm so the LLM handles both
+    // changes in one coherent pass.
+    //
+    // Only promote a PlannedFix when ALL of its edits co-locate with an
+    // LLM violation; if some edits are on unrelated lines, keep the
+    // entire fix as a deterministic pattern fix.
+    let llm_locations: HashSet<(PathBuf, u32)> = plan
+        .pending_llm
+        .iter()
+        .map(|req| (req.file_path.clone(), req.line))
+        .collect();
+
+    // Track locations where a prop-moved rule already describes the
+    // removal + migration destination. When a RemoveProp pattern fix
+    // co-locates with a prop-moved LLM rule, the pattern fix is strictly
+    // redundant — the prop-moved rule already tells the LLM that the
+    // prop was removed AND where it moved to. Promoting the RemoveProp
+    // would add a conflicting "just remove it" message that causes the
+    // LLM to drop the prop value instead of moving it.
+    let prop_moved_locations: HashSet<(PathBuf, u32)> = plan
+        .pending_llm
+        .iter()
+        .filter(|req| {
+            req.labels
+                .iter()
+                .any(|l| l == "change-type=prop-moved")
+                || req.rule_id.starts_with("sd-prop-moved-")
+        })
+        .map(|req| (req.file_path.clone(), req.line))
+        .collect();
+
+    let mut promoted = Vec::new();
+    let mut subsumed_count = 0usize;
+    for (file_path, fixes) in plan.files.iter_mut() {
+        let mut i = 0;
+        while i < fixes.len() {
+            let all_colocated = fixes[i]
+                .edits
+                .iter()
+                .all(|edit| llm_locations.contains(&(file_path.clone(), edit.line)));
+
+            if all_colocated {
+                // Check if a prop-moved rule already covers this location.
+                // If so, drop the pattern fix entirely — the prop-moved
+                // rule is strictly more informative (removal + destination).
+                if prop_moved_locations.contains(&(file_path.clone(), fixes[i].line)) {
+                    tracing::debug!(
+                        rule_id = %fixes[i].rule_id,
+                        file = %file_path.display(),
+                        line = fixes[i].line,
+                        "Dropping pattern fix subsumed by prop-moved rule"
+                    );
+                    fixes.remove(i);
+                    subsumed_count += 1;
+                } else {
+                    let fix = fixes.remove(i);
+                    promoted.push(fix_engine_core::LlmFixRequest {
+                        rule_id: fix.rule_id.clone(),
+                        file_uri: fix.file_uri.clone(),
+                        file_path: file_path.clone(),
+                        line: fix.line,
+                        message: fix.description.clone(),
+                        code_snip: None,
+                        source: None,
+                        labels: vec![],
+                        companion_test_files: vec![],
+                    });
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    plan.files.retain(|_, fixes| !fixes.is_empty());
+    let promoted_count = promoted.len();
+    plan.pending_llm.extend(promoted);
+    if promoted_count > 0 || subsumed_count > 0 {
+        if promoted_count > 0 {
+            progress.println(&format!(
+                "  {} Promoted {} co-located pattern fix(es) to LLM phase",
+                "info:".cyan().bold(),
+                promoted_count,
+            ));
+        }
+        if subsumed_count > 0 {
+            progress.println(&format!(
+                "  {} Dropped {} pattern fix(es) subsumed by prop-moved rules",
+                "info:".cyan().bold(),
+                subsumed_count,
+            ));
+        }
     }
 
     let pattern_fix_count: usize = plan
@@ -269,7 +453,7 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
 
     if should_apply && !plan.files.is_empty() {
         let phase = progress.start_phase("Applying pattern-based fixes...");
-        let result = engine::apply_fixes(&plan, &lang, &project)?;
+        let result = engine::apply_fixes(&plan, lang.as_ref(), &project)?;
 
         let mut detail_parts = vec![
             format!("{} files", result.files_modified),
@@ -294,7 +478,7 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
             }
         }
     } else if opts.dry_run {
-        let diff = engine::preview_fixes(&plan, &lang)?;
+        let diff = engine::preview_fixes(&plan, lang.as_ref())?;
         if diff.is_empty() {
             progress.println("No pattern-based auto-fixable changes found.");
         } else {
@@ -303,6 +487,47 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
                 "Planned pattern-based changes (use without --dry-run to apply):".dimmed(),
             ));
             println!("{}", diff);
+        }
+    }
+
+    // ── Filter stale LLM violations after pattern fixes ─────────────
+    //
+    // When running in single-invocation mode (pattern + LLM in one run),
+    // the pending_llm entries carry the original code_snip from the kantra
+    // output. Pattern fixes may have already resolved some of these
+    // violations. Check if the key text from each violation's code snippet
+    // still exists near the original line in the current file.
+    if should_apply && !plan.pending_llm.is_empty() {
+        let pre_filter_count = plan.pending_llm.len();
+        plan.pending_llm.retain(|req| {
+            let content = match std::fs::read_to_string(&req.file_path) {
+                Ok(c) => c,
+                Err(_) => return true, // keep if can't read
+            };
+
+            let fresh = fix_engine_core::is_violation_fresh(
+                req.code_snip.as_deref(),
+                req.line,
+                &content,
+            );
+            if !fresh {
+                tracing::debug!(
+                    rule = %req.rule_id,
+                    file = %req.file_path.display(),
+                    line = req.line,
+                    "Filtering stale LLM violation \
+                     (original code no longer at expected location)"
+                );
+            }
+            fresh
+        });
+        let filtered = pre_filter_count - plan.pending_llm.len();
+        if filtered > 0 {
+            progress.println(&format!(
+                "  {} Filtered {} stale violation(s) already resolved by pattern fixes",
+                "info:".cyan().bold(),
+                filtered,
+            ));
         }
     }
 
@@ -349,6 +574,7 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
                         &printer,
                         opts.goose_timeout,
                         opts.goose_max_families,
+                        opts.test_command.as_deref(),
                     );
 
                     let succeeded = results.iter().filter(|r| r.success).count();
@@ -362,6 +588,10 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
                             "0".to_string()
                         },
                     ));
+
+                    // Collect timed-out and failed files for the failures summary.
+                    let mut timed_out_entries: Vec<serde_json::Value> = Vec::new();
+                    let mut failed_entries: Vec<serde_json::Value> = Vec::new();
 
                     for (result, requests) in results.iter().zip({
                         let mut by_file: std::collections::BTreeMap<
@@ -379,6 +609,30 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
                             } else {
                                 fix_engine_core::SkipReason::GooseFailed
                             };
+
+                            // Collect rule IDs from the requests for this file.
+                            let rule_ids: Vec<String> = requests
+                                .iter()
+                                .map(|r| r.rule_id.clone())
+                                .collect();
+                            let file_uri = requests
+                                .first()
+                                .map(|r| r.file_uri.clone())
+                                .unwrap_or_default();
+
+                            if result.timed_out {
+                                timed_out_entries.push(serde_json::json!({
+                                    "file": file_uri,
+                                    "rule_ids": rule_ids,
+                                }));
+                            } else {
+                                failed_entries.push(serde_json::json!({
+                                    "file": file_uri,
+                                    "rule_ids": rule_ids,
+                                    "error": result.output.clone(),
+                                }));
+                            }
+
                             for req in requests {
                                 report.record_skip(
                                     &req.rule_id,
@@ -394,6 +648,34 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
                                     message: req.message.clone(),
                                     code_snip: req.code_snip.clone(),
                                 });
+                            }
+                        }
+                    }
+
+                    // Write timeouts.json to the log directory when there are
+                    // failures, so they can be retried with --only-files.
+                    if let Some(ref log_dir) = opts.log_dir {
+                        if !timed_out_entries.is_empty() || !failed_entries.is_empty() {
+                            let summary = serde_json::json!({
+                                "goose_timeout_secs": opts.goose_timeout,
+                                "timed_out": timed_out_entries,
+                                "failed": failed_entries,
+                            });
+                            let path = log_dir.join("timeouts.json");
+                            if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&summary).unwrap_or_default()) {
+                                progress.println(&format!(
+                                    "  {} Failed to write {}: {}",
+                                    "warning:".yellow().bold(),
+                                    path.display(),
+                                    e,
+                                ));
+                            } else {
+                                progress.println(&format!(
+                                    "  Wrote {} ({} timed out, {} failed)",
+                                    path.display(),
+                                    timed_out_entries.len(),
+                                    failed_entries.len(),
+                                ));
                             }
                         }
                     }
@@ -481,7 +763,7 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
 
                     if should_apply && !plan.files.is_empty() {
                         let apply_phase = progress.start_phase("Applying LLM fixes...");
-                        let result = engine::apply_fixes(&plan, &lang, &project)?;
+                        let result = engine::apply_fixes(&plan, lang.as_ref(), &project)?;
                         apply_phase.finish_with_detail(
                             "Applied LLM fixes",
                             &format!("{} edits", result.edits_applied),
@@ -663,4 +945,81 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
     }
 
     Ok(())
+}
+
+// ── --only-files support ─────────────────────────────────────────────
+
+/// A set of file URIs to filter violations against.
+struct FileFilter {
+    /// Normalized file URIs (e.g. "file:///path/to/File.tsx").
+    uris: HashSet<String>,
+}
+
+impl FileFilter {
+    /// Check whether an incident's file_uri matches any file in the filter.
+    fn matches(&self, file_uri: &str) -> bool {
+        self.uris.contains(file_uri)
+    }
+
+    fn len(&self) -> usize {
+        self.uris.len()
+    }
+}
+
+/// Normalize a path-or-URI string to a `file://` URI for matching.
+fn normalize_to_file_uri(s: &str) -> String {
+    let s = s.trim();
+    if s.starts_with("file://") {
+        s.to_string()
+    } else {
+        // Treat as a filesystem path; make absolute if relative.
+        let path = std::path::Path::new(s);
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(path)
+        };
+        format!("file://{}", abs.display())
+    }
+}
+
+/// Parse an `--only-files` input. Auto-detects format:
+///
+/// - **JSON with `timed_out`/`failed` arrays** (the `timeouts.json` format
+///   produced by a previous run): extracts `file` fields from both arrays.
+/// - **Plain text**: one file path or `file://` URI per line.
+fn parse_only_files(path: &std::path::Path) -> Result<FileFilter> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Could not read {}", path.display()))?;
+    let trimmed = content.trim_start();
+
+    let uris: HashSet<String> = if trimmed.starts_with('{') {
+        // Try parsing as timeouts.json
+        let doc: serde_json::Value = serde_json::from_str(&content)
+            .with_context(|| "Invalid JSON in --only-files")?;
+        let mut set = HashSet::new();
+        for key in &["timed_out", "failed"] {
+            if let Some(arr) = doc.get(key).and_then(|v| v.as_array()) {
+                for entry in arr {
+                    if let Some(file) = entry.get("file").and_then(|v| v.as_str()) {
+                        set.insert(normalize_to_file_uri(file));
+                    }
+                }
+            }
+        }
+        set
+    } else {
+        // Plain text: one path/URI per line
+        content
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| normalize_to_file_uri(l))
+            .collect()
+    };
+
+    anyhow::ensure!(!uris.is_empty(), "--only-files produced an empty file list from {}", path.display());
+    Ok(FileFilter { uris })
 }

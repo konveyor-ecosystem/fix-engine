@@ -183,6 +183,9 @@ struct MergedLlmFixRequest {
     /// Component family (e.g., "Modal", "Select") extracted from labels.
     /// Used to group related rules in the batch prompt.
     family: Option<String>,
+    /// Labels from the violation (e.g., "change-type=prop-to-child").
+    /// Used to generate targeted test file instructions.
+    labels: Vec<String>,
     /// Companion test files discovered near the component file.
     companion_test_files: Vec<PathBuf>,
 }
@@ -223,6 +226,7 @@ fn merge_by_rule_id(requests: &[&LlmFixRequest]) -> Vec<MergedLlmFixRequest> {
                 message: req.message.clone(),
                 code_snips,
                 family,
+                labels: req.labels.clone(),
                 companion_test_files: req.companion_test_files.clone(),
             });
         }
@@ -328,19 +332,39 @@ pub fn run_all_goose_fixes(
     printer: &crate::progress::ProgressPrinter,
     timeout_secs: u64,
     max_families_per_chunk: usize,
+    test_command: Option<&str>,
 ) -> Vec<GooseFixResult> {
-    // Create log directory if specified, removing stale logs from
-    // previous runs. Without cleanup, errored files (which previously
-    // didn't write logs) would leave behind stale entries from prior
-    // runs at the same index, making failure diagnosis misleading.
+    // Create log directory if specified, archiving logs from previous
+    // runs into a timestamped subdirectory. Without cleanup, errored
+    // files (which previously didn't write logs) would leave behind
+    // stale entries from prior runs at the same index, making failure
+    // diagnosis misleading.
     if let Some(dir) = log_dir {
         let _ = std::fs::create_dir_all(dir);
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                    let _ = std::fs::remove_file(path);
+        // Collect existing JSON files (goose-fix-NNN.json, timeouts.json, etc.)
+        let existing_json: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("json") {
+                    Some(p)
+                } else {
+                    None
                 }
+            })
+            .collect();
+        if !existing_json.is_empty() {
+            let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let archive_dir = dir.join(format!("previous-{}", ts));
+            if std::fs::create_dir_all(&archive_dir).is_ok() {
+                for path in &existing_json {
+                    if let Some(name) = path.file_name() {
+                        let _ = std::fs::rename(path, archive_dir.join(name));
+                    }
+                }
+                tracing::info!("Archived {} logs from previous run to {}", existing_json.len(), archive_dir.display());
             }
         }
     }
@@ -460,6 +484,7 @@ pub fn run_all_goose_fixes(
                     log_dir,
                     timeout_secs,
                     max_families_per_chunk,
+                    test_command,
                 );
 
                 if i == 0 {
@@ -529,6 +554,7 @@ fn process_single_file(
     log_dir: Option<&std::path::Path>,
     timeout_secs: u64,
     max_families_per_chunk: usize,
+    test_command: Option<&str>,
 ) -> (GooseFixResult, Vec<String>) {
     let mut log: Vec<String> = Vec::new();
 
@@ -559,6 +585,46 @@ fn process_single_file(
 
     let file_start = std::time::Instant::now();
 
+    // ── Pre-fix snapshot & baseline syntax check ──────────────────────────
+    //
+    // Snapshot the main file and companion test files before the LLM touches
+    // them. After all chunks complete we run the OXC parser again — if the
+    // LLM introduced syntax errors (e.g. normalising a Unicode curly
+    // apostrophe U+2019 → ASCII U+0027 inside a single-quoted string) we
+    // restore the originals and mark the fix as failed.
+    let pre_fix_snapshot: Option<String> = std::fs::read_to_string(file_path).ok();
+    let pre_fix_errors = crate::syntax_check::check_syntax(file_path).unwrap_or_default();
+
+    // Collect unique companion test files across all requests and snapshot
+    // their content so we can restore them if the LLM breaks them.
+    let companion_test_files: Vec<PathBuf> = {
+        let mut files: Vec<PathBuf> = file_requests
+            .iter()
+            .flat_map(|r| r.companion_test_files.iter().cloned())
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    };
+    let companion_snapshots: Vec<(PathBuf, String)> = companion_test_files
+        .iter()
+        .filter_map(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|content| (p.clone(), content))
+        })
+        .collect();
+    let companion_pre_fix_errors: std::collections::HashMap<PathBuf, Vec<String>> =
+        companion_test_files
+            .iter()
+            .map(|p| {
+                (
+                    p.clone(),
+                    crate::syntax_check::check_syntax(p).unwrap_or_default(),
+                )
+            })
+            .collect();
+
     // Split large batches into chunks to avoid overwhelming the LLM.
     // Each chunk runs sequentially — the LLM reads the file as modified
     // by the previous chunk. A context summary of previously applied
@@ -577,10 +643,17 @@ fn process_single_file(
     let mut chunk_retried: Vec<bool> = Vec::new();
     let mut applied_summaries: Vec<String> = Vec::new();
 
+    let has_test_files = file_requests
+        .iter()
+        .any(|r| !r.companion_test_files.is_empty());
+    let has_test_cmd = test_command.is_some() && has_test_files;
+
     if file_requests.len() == 1 {
-        let prompt = build_merged_prompt(&file_requests[0], ctx);
+        let prompt = build_merged_prompt(&file_requests[0], ctx, test_command);
         all_prompts.push(prompt.clone());
-        let max_turns_str = "5".to_string();
+        // Increase turns when running tests — the LLM needs headroom for
+        // fix → test → read error → fix → re-test iterations.
+        let max_turns_str = if has_test_cmd { "15" } else { "5" }.to_string();
         let mut goose_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs);
         let mut was_retried = false;
         // Retry once on empty response
@@ -695,10 +768,15 @@ fn process_single_file(
                     Some(&applied_summaries)
                 },
                 ctx,
+                test_command,
             );
             all_prompts.push(prompt.clone());
 
-            let max_turns = (22 + chunk.len()).min(40);
+            let max_turns = if has_test_cmd {
+                (30 + chunk.len()).min(50)
+            } else {
+                (22 + chunk.len()).min(40)
+            };
             let max_turns_str = max_turns.to_string();
             let chunk_start = std::time::Instant::now();
             let mut chunk_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs);
@@ -923,6 +1001,36 @@ fn process_single_file(
         }
     }
 
+    // ── Post-fix syntax validation ──────────────────────────────────────
+    //
+    // If the LLM reported success, parse the file(s) it wrote and compare
+    // against the baseline. Any *new* syntax error is a regression — the
+    // most common cause is Unicode normalisation (e.g. curly apostrophe →
+    // ASCII apostrophe breaking a single-quoted string). When a regression
+    // is detected we restore every snapshotted file and flip success→false.
+    if let Ok(ref r) = result {
+        if r.success {
+            let (syntax_ok, validation_log) = validate_post_fix(
+                file_path,
+                &pre_fix_snapshot,
+                &pre_fix_errors,
+                &companion_snapshots,
+                &companion_pre_fix_errors,
+            );
+            log.extend(validation_log);
+            if !syntax_ok {
+                result = Ok(GooseFixResult {
+                    file_path: file_path.to_path_buf(),
+                    rule_id: r.rule_id.clone(),
+                    success: false,
+                    output: "Syntax regression detected — restored original file(s)"
+                        .to_string(),
+                    timed_out: false,
+                });
+            }
+        }
+    }
+
     let elapsed = file_start.elapsed();
 
     match result {
@@ -1061,6 +1169,134 @@ fn process_single_file(
     }
 }
 
+// ── Post-fix syntax validation ─────────────────────────────────────────────
+
+/// Validate that the LLM did not introduce syntax errors.
+///
+/// Compares the pre-fix error set with a fresh parse of the post-fix file.
+/// Only flags *new* errors — files that already had syntax errors before the
+/// LLM ran are not penalised for pre-existing problems.
+///
+/// When a regression is detected every snapshotted file is restored to its
+/// pre-fix content and the function returns `(false, log_lines)`.
+fn validate_post_fix(
+    file_path: &std::path::Path,
+    pre_fix_snapshot: &Option<String>,
+    pre_fix_errors: &[String],
+    companion_snapshots: &[(PathBuf, String)],
+    companion_pre_fix_errors: &std::collections::HashMap<PathBuf, Vec<String>>,
+) -> (bool, Vec<String>) {
+    use crate::syntax_check;
+
+    let mut log = Vec::new();
+    let mut has_regressions = false;
+
+    // ── Main file ──────────────────────────────────────────────────────
+    if syntax_check::is_checkable(file_path) {
+        let post_errors = syntax_check::check_syntax(file_path).unwrap_or_default();
+
+        // If the file was clean before and now has errors → regression.
+        // When the file already had errors we cannot reliably distinguish
+        // shifted pre-existing errors from genuinely new ones, so we only
+        // flag the clear-cut "was clean, now broken" case.
+        if pre_fix_errors.is_empty() && !post_errors.is_empty() {
+            has_regressions = true;
+            let name = file_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| file_path.display().to_string());
+            log.push(format!(
+                "         {}: SYNTAX REGRESSION — {} error(s) introduced by LLM fix",
+                name,
+                post_errors.len()
+            ));
+            for err in &post_errors {
+                log.push(format!("           {}", err));
+            }
+        }
+    }
+
+    // ── Companion test files ───────────────────────────────────────────
+    for (path, pre_content) in companion_snapshots {
+        if !syntax_check::is_checkable(path) {
+            continue;
+        }
+        // Only validate if the file was actually modified by the LLM.
+        let current = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if &current == pre_content {
+            continue; // Unchanged — nothing to validate.
+        }
+
+        let pre_errors = companion_pre_fix_errors
+            .get(path)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let post_errors = syntax_check::check_syntax(path).unwrap_or_default();
+
+        if pre_errors.is_empty() && !post_errors.is_empty() {
+            has_regressions = true;
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            log.push(format!(
+                "         {}: SYNTAX REGRESSION — {} error(s) in companion test file",
+                name,
+                post_errors.len()
+            ));
+            for err in &post_errors {
+                log.push(format!("           {}", err));
+            }
+        }
+    }
+
+    // ── Restore originals on regression ────────────────────────────────
+    if has_regressions {
+        log.push("         Restoring pre-fix file(s)...".to_string());
+        if let Some(original) = pre_fix_snapshot {
+            if std::fs::write(file_path, original).is_ok() {
+                log.push(format!(
+                    "         ✓ Restored {}",
+                    file_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ));
+            }
+        }
+        for (path, content) in companion_snapshots {
+            // Only restore files that were actually modified.
+            let current = std::fs::read_to_string(path).unwrap_or_default();
+            if current != *content {
+                if std::fs::write(path, content).is_ok() {
+                    log.push(format!(
+                        "         ✓ Restored {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                }
+            }
+        }
+    }
+
+    (!has_regressions, log)
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+/// Returns true when the labels indicate a test-impact-only rule — one that
+/// describes behavioral changes affecting tests but requires no source code
+/// modifications. A rule is test-impact-only when it has `change-type=test-impact`
+/// and NO other `change-type=` labels (which would indicate a source-level fix).
+fn is_test_impact_only(labels: &[String]) -> bool {
+    labels.iter().any(|l| l == "change-type=test-impact")
+        && !labels
+            .iter()
+            .any(|l| l.starts_with("change-type=") && l != "change-type=test-impact")
+}
+
 // ── Companion test file section ────────────────────────────────────────────
 
 /// Format the companion test files section for inclusion in Goose prompts.
@@ -1068,7 +1304,11 @@ fn process_single_file(
 /// When companion test files are discovered, this produces a section listing
 /// them so the LLM knows it MUST read and check them alongside the main file.
 /// Returns an empty string when no test files are present.
-fn format_companion_test_files_section(test_files: &[PathBuf]) -> String {
+fn format_companion_test_files_section(
+    test_files: &[PathBuf],
+    requests: &[&MergedLlmFixRequest],
+    test_command: Option<&str>,
+) -> String {
     if test_files.is_empty() {
         return String::new();
     }
@@ -1078,17 +1318,152 @@ fn format_companion_test_files_section(test_files: &[PathBuf]) -> String {
         .map(|p| format!("- {}", p.display()))
         .collect();
 
+    // Build targeted test-fix instructions from the rules being applied.
+    let mut test_hints = Vec::new();
+
+    // Extract concrete search terms from rule messages: component names,
+    // old API names, CSS classes, etc.
+    let mut search_terms = Vec::new();
+    let mut has_dom_changes = false;
+    let mut has_rename = false;
+    let mut has_import_change = false;
+
+    for req in requests {
+        // Check labels for change types
+        for label in &req.labels {
+            if label.starts_with("change-type=") {
+                let ct = &label["change-type=".len()..];
+                match ct {
+                    "prop-to-child" | "composition" | "dom-structure" => {
+                        has_dom_changes = true;
+                    }
+                    "rename" => {
+                        has_rename = true;
+                    }
+                    "import-path-change" => {
+                        has_import_change = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Extract old → new names from the rule message for search terms.
+        // Look for patterns like "renamed to X", "changed from X to Y",
+        // "removed", "moved to"
+        if req.family.is_some() {
+            has_dom_changes = true;
+        }
+
+        // Check for test-impact related content in the message
+        if req.message.contains("wrapper")
+            || req.message.contains("children")
+            || req.message.contains("getByText")
+        {
+            has_dom_changes = true;
+        }
+    }
+
+    // Collect component/rule names as search hints
+    for req in requests {
+        // Extract component names from rule IDs for search terms
+        // e.g., "semver-text-component-import-deprecated" → "Text"
+        // e.g., "family:Modal" → "Modal"
+        if let Some(ref fam) = req.family {
+            search_terms.push(fam.clone());
+        }
+        if req.rule_id.contains("rename") || req.rule_id.contains("deprecated") {
+            has_rename = true;
+        }
+    }
+    search_terms.sort();
+    search_terms.dedup();
+
+    // Always include the concrete search instruction
+    test_hints.push(
+        "Search the test file for every old API name, component name, or CSS class \
+         that you changed in the main file. If you renamed X to Y, search the test \
+         for 'X' in strings, role queries, text queries, and selectors."
+            .to_string(),
+    );
+
+    if has_dom_changes {
+        test_hints.push(
+            "Component DOM structure changed. Tests using getByText() may now return \
+             a wrapper element (e.g., <span>) instead of the component root (e.g., \
+             <button>). Check assertions like toBeInstanceOf(), toHaveFocus(), and \
+             closest(). Consider using getByRole() with a name option instead."
+                .to_string(),
+        );
+    }
+
+    if has_rename {
+        test_hints.push(
+            "Components or props were renamed. Search the test for old names in \
+             getByRole(), getByLabelText(), getByText(), querySelector(), and \
+             data-testid selectors. Update them to the new names."
+                .to_string(),
+        );
+    }
+
+    if has_import_change {
+        test_hints.push(
+            "Import paths changed. If the test file mocks the old import source, \
+             update the mock to use the new import path. If the test imports \
+             components directly, update those imports too."
+                .to_string(),
+        );
+    }
+
+    if !search_terms.is_empty() {
+        test_hints.push(format!(
+            "Specifically search for these names in the test file: {}",
+            search_terms.join(", "),
+        ));
+    }
+
+    let hints_section = test_hints
+        .iter()
+        .map(|h| format!("- {}", h))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let test_run_section = if let Some(cmd_template) = test_command {
+        let commands: Vec<String> = test_files
+            .iter()
+            .map(|f| {
+                cmd_template.replace("{test_file}", &f.display().to_string())
+            })
+            .collect();
+
+        format!(
+            "\n## REQUIRED: Run tests to verify your changes\n\
+             After fixing the main file AND any companion test files, you MUST run \
+             the tests to verify everything works. Run this command:\n\n\
+             ```bash\n{}\n```\n\n\
+             If tests fail:\n\
+             1. Read the failure output carefully — it tells you the exact assertion \
+             that failed, what was expected vs what was received\n\
+             2. Fix the test file based on the ACTUAL error (not guessing)\n\
+             3. Re-run the test to confirm your fix\n\
+             4. Repeat until tests pass or you have made 3 attempts\n\n\
+             Do NOT skip this step. Do NOT guess whether tests will pass — run them.\n",
+            commands.join("\n"),
+        )
+    } else {
+        String::new()
+    };
+
     format!(
-        "\nCompanion test files — you MUST read these after applying fixes:\n{}\n\
-         After fixing the main file, read each test file above and check if any test:\n\
-         - Opens a dropdown/menu/popover and queries for content (getByText, getByRole)\n\
-         - Uses querySelector with OUIA selectors to interact with components\n\
-         - Asserts on element roles, aria attributes, or data attributes that changed\n\
-         If any test would break due to your changes, fix it. Common test fixes:\n\
-         - Wrap assertions in waitFor() when content renders via portal\n\
-         - Add popperProps={{{{ appendTo: 'inline' }}}} to component renders in tests\n\
-         - Update getByRole/getByText queries to match new attribute values\n",
-        file_list.join("\n"),
+        "\nCompanion test files — you MUST read these after applying fixes:\n{file_list}\n\
+         After fixing the main file, read each test file and verify it still works \
+         with your changes. Fix any test that would break.\n\n\
+         Verification steps:\n\
+         {hints}\n\
+         {test_run}\n",
+        file_list = file_list.join("\n"),
+        hints = hints_section,
+        test_run = test_run_section,
     )
 }
 
@@ -1096,7 +1471,11 @@ fn format_companion_test_files_section(test_files: &[PathBuf]) -> String {
 
 /// Build a prompt for a single merged fix request (one unique rule, possibly
 /// multiple incident lines).
-fn build_merged_prompt(request: &MergedLlmFixRequest, ctx: &dyn FixContext) -> String {
+fn build_merged_prompt(
+    request: &MergedLlmFixRequest,
+    ctx: &dyn FixContext,
+    test_command: Option<&str>,
+) -> String {
     let lines_display = request
         .lines
         .iter()
@@ -1123,7 +1502,30 @@ fn build_merged_prompt(request: &MergedLlmFixRequest, ctx: &dyn FixContext) -> S
         format!("\nIMPORTANT constraints:\n{}", lines.join("\n"))
     };
 
-    let test_files_section = format_companion_test_files_section(&request.companion_test_files);
+    let test_files_section = format_companion_test_files_section(
+        &request.companion_test_files,
+        &[request],
+        test_command,
+    );
+
+    // Test-impact-only rules describe behavioral changes that may affect tests
+    // but require no source code modifications. Adjust the instructions so the
+    // LLM treats the rule as context for test evaluation, not a source code fix.
+    let is_test_only = is_test_impact_only(&request.labels);
+
+    let step2 = if is_test_only {
+        "2. **TEST-IMPACT ONLY** — This rule describes behavioral changes in rendered \
+         sub-components that may affect tests. Do NOT modify the source file for this \
+         rule (do not add props, wrappers, or workarounds). Read the companion test \
+         files listed above and fix any test assertions that would break due to the \
+         described behavioral changes."
+            .to_string()
+    } else {
+        format!(
+            "2. Apply ONLY the change described by the migration rule at or near line {}",
+            lines_display,
+        )
+    };
 
     format!(
         r#"You are applying a {migration_desc} fix.
@@ -1139,16 +1541,23 @@ Code context:
 {code_context}
 ```
 
+CRITICAL — CHARACTER PRESERVATION:
+All special characters in the file must remain as Unicode. Do NOT replace Unicode punctuation (such as curly quotes, em dashes, or other non-ASCII characters) with ASCII equivalents. Doing so will cause syntax errors and your fix will be automatically reverted.
+
+CRITICAL — TOKEN/VARIABLE RENAMING:
+When renaming React tokens (from @patternfly/react-tokens), only add the `t_` prefix to the existing name. Do NOT change the base token name (e.g., `global_spacer_md` → `t_global_spacer_md`, NOT `t_global_spacer_300`).
+When renaming CSS custom properties, use the `--pf-v6-` prefix, NOT `--pf-t--` (e.g., `--pf-v5-global--spacer--md` → `--pf-v6-global--spacer--md`).
+
 Instructions:
 1. Read the file at {file_path}
-2. Apply ONLY the change described by the migration rule at or near line {lines}
-3. Make the minimum edit necessary — do not change unrelated code, but DO clean up any artifacts caused by your change (e.g., remove imports that are no longer referenced, delete dead declarations)
-4. After determining your changes, reason through any functional side effects: verify that your edits preserve the existing behavior of the surrounding code. If a migration change makes existing variables, state, or logic redundant, clean up the affected code so the file remains correct and consistent.
-5. Write the fixed file
-6. REQUIRED: If companion test files are listed above, read EACH one now. Do NOT skip this step. For each test file, check whether your changes to the main file would cause test failures (e.g., portal rendering means getByText/getByRole won't find dropdown content, renamed attributes break selectors). If a test would break, apply the fix and write the updated test file.
+{step2}
+3. Make the minimum edit necessary — do not change unrelated code, but you MUST clean up all artifacts caused by your change. Specifically: if your edit introduces a new type or component reference (e.g., MenuToggleElement, ModalHeader), ADD the import for it. If your edit makes an import binding unused, REMOVE that binding from the import statement (or remove the entire import if all bindings are unused). Similarly, delete any dead variable declarations, unused helper functions, or orphaned type imports that your change made redundant. Do NOT leave unused imports "just in case" — the file must compile and pass strict no-unused-vars linting after your edit.
+4. After determining your changes, verify that your edits preserve the existing behavior of the surrounding code. Do NOT add new components, props, or imports that are not explicitly required by the migration rule above. Do NOT restructure JSX beyond what the specific violation describes. Only clean up imports/variables that YOUR edit made unused.
+5. Write the fixed file. All special characters must remain as Unicode — do not downgrade to ASCII (see CHARACTER PRESERVATION above).
+6. REQUIRED: If companion test files are listed above, read EACH one now. Do NOT skip this step. For each test file, check whether your changes to the main file would cause test failures. If a test would break, apply the fix and write the updated test file.
 {constraints_section}
 
-Before writing, reason through the fix step by step to ensure nothing is missed. Then read the file, make the edit, and write it.
+Before writing, reason through the fix step by step to ensure nothing is missed. Verify that only the lines affected by the fixes were changed and that all special characters remain as Unicode. Then read the file, make the edit, and write it.
 
 After writing the file, produce a '## Changes Applied' section that lists the change you made, or note if the fix was already applied or could not be applied (with a brief reason)."#,
         migration_desc = ctx.migration_description(),
@@ -1158,6 +1567,7 @@ After writing the file, produce a '## Changes Applied' section that lists the ch
         rule_id = request.rule_id,
         message = request.message,
         code_context = code_context,
+        step2 = step2,
         constraints_section = constraints_section,
     )
 }
@@ -1171,6 +1581,20 @@ fn format_fix_entry(fixes: &mut String, fix_num: usize, req: &MergedLlmFixReques
         .collect::<Vec<_>>()
         .join(", ");
 
+    // Test-impact-only rules describe behavioral changes in sub-components
+    // that may affect tests. They should NOT cause source file modifications —
+    // the LLM should use them only as context when evaluating companion test
+    // files for breakage.
+    let test_impact_preamble = if is_test_impact_only(&req.labels) {
+        "\n**TEST-IMPACT ONLY — DO NOT modify the source file for this rule.**\n\
+         This describes a behavioral change in a rendered sub-component that may \
+         affect tests. Use this information ONLY when evaluating companion test \
+         files for breakage. Do not add props, wrappers, or workarounds to the \
+         source file based on this rule.\n"
+    } else {
+        ""
+    };
+
     if req.lines.len() == 1 {
         let code_context = req
             .code_snips
@@ -1182,7 +1606,7 @@ fn format_fix_entry(fixes: &mut String, fix_num: usize, req: &MergedLlmFixReques
 ### Fix {num}
 Line: {line}
 Rule [{rule_id}]:
-{message}
+{test_impact}{message}
 
 Code context:
 ```
@@ -1192,6 +1616,7 @@ Code context:
             num = fix_num,
             line = lines_display,
             rule_id = req.rule_id,
+            test_impact = test_impact_preamble,
             message = req.message,
             code_context = code_context,
         ));
@@ -1205,7 +1630,7 @@ Code context:
 ### Fix {num}
 Lines: {lines}
 Rule [{rule_id}]:
-{message}
+{test_impact}{message}
 
 This rule affects multiple locations in the file. Apply ALL steps together as one logical change.
 
@@ -1216,6 +1641,7 @@ Code contexts:
             num = fix_num,
             lines = lines_display,
             rule_id = req.rule_id,
+            test_impact = test_impact_preamble,
             message = req.message,
             all_snippets = all_snippets,
         ));
@@ -1227,6 +1653,7 @@ fn build_batch_prompt_with_context(
     requests: &[&MergedLlmFixRequest],
     previously_applied: Option<&[String]>,
     ctx: &dyn FixContext,
+    test_command: Option<&str>,
 ) -> String {
     // Aggregate companion test files from all requests for this file
     let mut all_test_files: Vec<PathBuf> = requests
@@ -1235,7 +1662,8 @@ fn build_batch_prompt_with_context(
         .collect();
     all_test_files.sort();
     all_test_files.dedup();
-    let test_files_section = format_companion_test_files_section(&all_test_files);
+    let test_files_section =
+        format_companion_test_files_section(&all_test_files, requests, test_command);
 
     // Group requests by component family so the LLM sees related rules
     // as one coherent migration (e.g., all Modal prop→child + composition
@@ -1315,27 +1743,54 @@ fn build_batch_prompt_with_context(
         .map(|v| format!("\n{}\n", v))
         .unwrap_or_default();
 
+    // For files with many violations (10+), add a preamble suggesting the file may need
+    // a complete rewrite or deletion rather than individual fixes.
+    let high_violation_preamble = if requests.len() >= 10 {
+        format!(
+            "\n## IMPORTANT: This file has {} violations\n\n\
+             This many violations often means the file wraps an API that was \
+             completely removed and needs a full rewrite rather than individual \
+             fixes. Before processing each fix individually:\n\
+             1. Check if ANY other file in the project references this class by name \
+             (search for the class name in imports of other files).\n\
+             2. If no other file references it, this file is dead code — **delete it entirely**.\n\
+             3. If a factory or caller references a replacement class that doesn't exist, \
+             **create that replacement class** as a new file in the same package.\n\
+             4. Only apply individual fixes if the class has external callers and can't be deleted.\n\n",
+            requests.len(),
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"You are applying {migration_desc} fixes to a single file.
 
 File: {file_path}
-{test_files_section}{context_section}
+{test_files_section}{context_section}{high_violation_preamble}
 Apply ALL of the following {count} fixes to this file:
 {fixes}
+CRITICAL — CHARACTER PRESERVATION:
+All special characters in the file must remain as Unicode. Do NOT replace Unicode punctuation (such as curly quotes, em dashes, or other non-ASCII characters) with ASCII equivalents. Doing so will cause syntax errors and your fix will be automatically reverted.
+
+CRITICAL — TOKEN/VARIABLE RENAMING:
+When renaming React tokens (from @patternfly/react-tokens), only add the `t_` prefix to the existing name. Do NOT change the base token name (e.g., `global_spacer_md` → `t_global_spacer_md`, NOT `t_global_spacer_300`).
+When renaming CSS custom properties, use the `--pf-v6-` prefix, NOT `--pf-t--` (e.g., `--pf-v5-global--spacer--md` → `--pf-v6-global--spacer--md`).
+
 Instructions:
 1. Read the file at {file_path}
 2. Process each fix INDEPENDENTLY in sequence. For each fix:
    a. Identify the exact code affected (line number and affected element)
    b. Determine the specific change needed ({change_examples})
    c. Track all changes for the final write
-3. Make the minimum edits necessary — do not change unrelated code, but DO clean up any artifacts caused by your changes (e.g., remove imports that are no longer referenced, delete dead declarations)
-4. After determining your changes, reason through any functional side effects: verify that your edits preserve the existing behavior of the surrounding code. If a migration change makes existing variables, state, or logic redundant, clean up the affected code so the file remains correct and consistent.
+3. Make the minimum edits necessary — do not change unrelated code, but you MUST clean up all artifacts caused by your changes. Specifically: if your edits introduce a new type or component reference (e.g., MenuToggleElement, ModalHeader), ADD the import for it. If your edits make an import binding unused, REMOVE that binding from the import statement (or remove the entire import if all bindings are unused). Similarly, delete any dead variable declarations, unused helper functions, or orphaned type imports that your changes made redundant. Do NOT leave unused imports "just in case" — the file must compile and pass strict no-unused-vars linting after your edits.
+4. After determining your changes, verify that your edits preserve the existing behavior of the surrounding code. Do NOT add new components, props, or imports that are not explicitly required by the migration rules above. Do NOT restructure JSX beyond what the specific violations describe. Only clean up imports/variables that YOUR edits made unused.
 5. Do NOT revert any changes that were already applied in previous passes
-6. Write the fixed file once with ALL changes from every fix applied
-7. REQUIRED: If companion test files are listed above, read EACH one now. Do NOT skip this step. For each test file, check whether your changes to the main file would cause test failures (e.g., portal rendering means getByText/getByRole won't find dropdown content, renamed attributes break selectors). If a test would break, apply the fix and write the updated test file.
+6. Write the fixed file once with ALL changes from every fix applied. All special characters must remain as Unicode — do not downgrade to ASCII (see CHARACTER PRESERVATION above).
+7. REQUIRED: If companion test files are listed above, read EACH one now. Do NOT skip this step. For each test file, check whether your changes to the main file would cause test failures. If a test would break, apply the fix and write the updated test file.
 {constraints_section}
 {verification_section}
-Before writing, reason through each fix step by step to ensure nothing is missed. Then read the file, make the edits, and write it.
+Before writing, reason through each fix step by step to ensure nothing is missed. Verify that only the lines affected by the fixes were changed and that all special characters remain as Unicode. Then read the file, make the edits, and write it.
 
 After writing the file, produce a '## Changes Applied' section that lists each change you made, each fix that was already applied (no change needed), and each fix you could not apply (with a brief reason). This summary is used by subsequent processing steps."#,
         migration_desc = ctx.migration_description(),
@@ -1513,6 +1968,7 @@ mod tests {
             &merged_refs,
             None,
             &ctx,
+            None,
         );
 
         // All rules appear in the prompt
@@ -1676,5 +2132,262 @@ mod tests {
         let section = result.unwrap();
         assert!(section.contains("Fixed Modal"));
         assert!(!section.contains("Additional Notes"));
+    }
+
+    // ── is_test_impact_only tests ───────────────────────────────────
+
+    #[test]
+    fn test_is_test_impact_only_true() {
+        let labels = vec![
+            "source=semver-analyzer".to_string(),
+            "change-type=test-impact".to_string(),
+            "impact=frontend-testing".to_string(),
+        ];
+        assert!(is_test_impact_only(&labels));
+    }
+
+    #[test]
+    fn test_is_test_impact_only_false_no_label() {
+        let labels = vec![
+            "source=semver-analyzer".to_string(),
+            "change-type=rename".to_string(),
+        ];
+        assert!(!is_test_impact_only(&labels));
+    }
+
+    #[test]
+    fn test_is_test_impact_only_false_mixed() {
+        // Has both test-impact AND another change-type — not test-only.
+        let labels = vec![
+            "change-type=test-impact".to_string(),
+            "change-type=prop-to-child".to_string(),
+        ];
+        assert!(!is_test_impact_only(&labels));
+    }
+
+    // ── test-impact prompt constraint tests ──────────────────────────
+
+    #[test]
+    fn test_merged_prompt_test_impact_only_has_constraint() {
+        let mut req = make_req("sd-test-tooltip-transitive-behavioral-changes");
+        req.labels = vec![
+            "source=semver-analyzer".to_string(),
+            "change-type=test-impact".to_string(),
+            "impact=frontend-testing".to_string(),
+        ];
+        req.companion_test_files = vec![PathBuf::from("/tmp/__tests__/test.spec.tsx")];
+        let refs = vec![&req];
+        let merged = merge_by_rule_id(&refs);
+
+        let ctx = crate::context::GenericFixContext;
+        let prompt = build_merged_prompt(&merged[0], &ctx, None);
+
+        assert!(
+            prompt.contains("TEST-IMPACT ONLY"),
+            "prompt should contain TEST-IMPACT ONLY constraint for test-impact rules"
+        );
+        assert!(
+            prompt.contains("Do NOT modify the source file"),
+            "prompt should instruct not to modify source file"
+        );
+        assert!(
+            !prompt.contains("Apply ONLY the change described"),
+            "prompt should NOT contain the standard 'apply change' instruction"
+        );
+    }
+
+    #[test]
+    fn test_merged_prompt_source_change_has_no_test_impact_constraint() {
+        let mut req = make_req("semver-modal-prop-to-child");
+        req.labels = vec![
+            "source=semver-analyzer".to_string(),
+            "change-type=prop-to-child".to_string(),
+        ];
+        let refs = vec![&req];
+        let merged = merge_by_rule_id(&refs);
+
+        let ctx = crate::context::GenericFixContext;
+        let prompt = build_merged_prompt(&merged[0], &ctx, None);
+
+        assert!(
+            !prompt.contains("TEST-IMPACT ONLY"),
+            "prompt should NOT contain test-impact constraint for source-change rules"
+        );
+        assert!(
+            prompt.contains("Apply ONLY the change described"),
+            "prompt should contain the standard 'apply change' instruction"
+        );
+    }
+
+    #[test]
+    fn test_batch_prompt_test_impact_entry_has_preamble() {
+        let mut req_source = make_req("semver-text-import-deprecated");
+        req_source.labels = vec!["change-type=rename".to_string()];
+
+        let mut req_test = make_req("sd-test-tooltip-transitive-behavioral-changes");
+        req_test.labels = vec!["change-type=test-impact".to_string()];
+        req_test.companion_test_files = vec![PathBuf::from("/tmp/__tests__/test.spec.tsx")];
+
+        let reqs = vec![&req_source, &req_test];
+        let merged = merge_by_rule_id(&reqs);
+        let merged_refs: Vec<&MergedLlmFixRequest> = merged.iter().collect();
+
+        let ctx = crate::context::GenericFixContext;
+        let prompt = build_batch_prompt_with_context(
+            &PathBuf::from("/tmp/test.tsx"),
+            &merged_refs,
+            None,
+            &ctx,
+            None,
+        );
+
+        // The batch prompt should contain the preamble for the test-impact entry
+        assert!(
+            prompt.contains("TEST-IMPACT ONLY"),
+            "batch prompt should contain TEST-IMPACT ONLY for test-impact rules"
+        );
+        assert!(
+            prompt.contains("DO NOT modify the source file for this rule"),
+            "batch prompt should say not to modify source for test-impact rules"
+        );
+        // But the source-change rule should NOT have the preamble
+        assert!(
+            prompt.contains("semver-text-import-deprecated"),
+            "batch prompt should still include the source-change rule"
+        );
+    }
+
+    // ── validate_post_fix tests ─────────────────────────────────────
+
+    #[test]
+    fn test_validate_post_fix_clean_file_stays_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Good.tsx");
+        let original = "export const App = () => <div>Hello</div>;\n";
+        std::fs::write(&file, original).unwrap();
+
+        let pre_errors = crate::syntax_check::check_syntax(&file).unwrap();
+        assert!(pre_errors.is_empty());
+
+        // File unchanged → no regression.
+        let (ok, log) = validate_post_fix(
+            &file,
+            &Some(original.to_string()),
+            &pre_errors,
+            &[],
+            &std::collections::HashMap::new(),
+        );
+        assert!(ok, "unchanged clean file should pass: {:?}", log);
+    }
+
+    #[test]
+    fn test_validate_post_fix_detects_unicode_normalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Welcome.tsx");
+
+        // Original has curly apostrophe (U+2019) — valid JS.
+        let original = "const x = 'Let\u{2019}s get started.';\n";
+        std::fs::write(&file, original).unwrap();
+
+        let pre_errors = crate::syntax_check::check_syntax(&file).unwrap();
+        assert!(
+            pre_errors.is_empty(),
+            "curly apostrophe should be valid: {:?}",
+            pre_errors
+        );
+
+        // LLM normalizes curly apostrophe → ASCII apostrophe — broken JS.
+        let broken = "const x = 'Let's get started.';\n";
+        std::fs::write(&file, broken).unwrap();
+
+        let (ok, log) = validate_post_fix(
+            &file,
+            &Some(original.to_string()),
+            &pre_errors,
+            &[],
+            &std::collections::HashMap::new(),
+        );
+        assert!(!ok, "should detect syntax regression");
+        assert!(
+            log.iter().any(|l| l.contains("SYNTAX REGRESSION")),
+            "log should mention syntax regression: {:?}",
+            log
+        );
+
+        // Should have restored the original.
+        let restored = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(restored, original, "original should be restored");
+    }
+
+    #[test]
+    fn test_validate_post_fix_ignores_pre_existing_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("AlreadyBroken.tsx");
+
+        // File starts with a syntax error.
+        let original = "const x = 'already broken;\n";
+        std::fs::write(&file, original).unwrap();
+
+        let pre_errors = crate::syntax_check::check_syntax(&file).unwrap();
+        assert!(!pre_errors.is_empty());
+
+        // File still has errors after LLM — but pre-existing errors
+        // should NOT trigger a regression.
+        let (ok, _log) = validate_post_fix(
+            &file,
+            &Some(original.to_string()),
+            &pre_errors,
+            &[],
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            ok,
+            "pre-existing errors should not count as a regression"
+        );
+    }
+
+    #[test]
+    fn test_validate_post_fix_restores_companion_test_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_file = dir.path().join("Component.tsx");
+        let test_file = dir.path().join("Component.test.tsx");
+
+        let main_original = "export const Foo = () => <div />;\n";
+        let test_original = "import { Foo } from './Component';\n";
+
+        std::fs::write(&main_file, main_original).unwrap();
+        std::fs::write(&test_file, test_original).unwrap();
+
+        let pre_main_errors = crate::syntax_check::check_syntax(&main_file).unwrap();
+        let pre_test_errors = crate::syntax_check::check_syntax(&test_file).unwrap();
+        assert!(pre_main_errors.is_empty());
+        assert!(pre_test_errors.is_empty());
+
+        let mut companion_pre = std::collections::HashMap::new();
+        companion_pre.insert(test_file.clone(), pre_test_errors);
+        let companion_snapshots = vec![(test_file.clone(), test_original.to_string())];
+
+        // LLM breaks the test file.
+        let broken_test = "import { Foo from './Component';\n";
+        std::fs::write(&test_file, broken_test).unwrap();
+
+        let (ok, log) = validate_post_fix(
+            &main_file,
+            &Some(main_original.to_string()),
+            &pre_main_errors,
+            &companion_snapshots,
+            &companion_pre,
+        );
+        assert!(!ok, "should detect companion file regression");
+        assert!(
+            log.iter()
+                .any(|l| l.contains("companion test file")),
+            "log should mention companion test: {:?}",
+            log
+        );
+
+        // Test file should be restored.
+        let restored = std::fs::read_to_string(&test_file).unwrap();
+        assert_eq!(restored, test_original);
     }
 }

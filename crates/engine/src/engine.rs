@@ -13,6 +13,7 @@ use anyhow::Result;
 use fix_engine_core::*;
 use konveyor_core::incident::Incident;
 use konveyor_core::report::RuleSet;
+use node_semver::Range as SemverRange;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -35,6 +36,18 @@ pub fn plan_fixes(
     report: &mut FixReport,
 ) -> Result<FixPlan> {
     let mut plan = FixPlan::default();
+
+    // Pre-process: merge EnsureDependency strategies that target the same
+    // package but specify different version ranges (e.g., react rules say
+    // "^18.3.1" while PF rules say "^17 || ^18 || ^19"). The narrowest
+    // range that is compatible with all others is used.
+    let strategies = merge_ensure_dependency_versions(strategies);
+
+    // Pre-compute dead CSS class texts from violations labeled
+    // "change-type=css-dead-class". These are classes where a naive
+    // v5→v6 prefix swap produces a non-existent class. Used to suppress
+    // CssVariablePrefix edits that would create broken class references.
+    let dead_css_classes = collect_dead_css_classes(output);
 
     for ruleset in output {
         for (rule_id, violation) in &ruleset.violations {
@@ -84,6 +97,33 @@ pub fn plan_fixes(
                             plan.files.entry(file_path).or_default().push(fix);
                         }
                     }
+                    FixStrategy::JavaImportRename {
+                        ref old_fqn,
+                        ref new_fqn,
+                    } => {
+                        if let Some(fix) = lang.plan_import_rename(
+                            rule_id, incident, old_fqn, new_fqn, &file_path, report,
+                        ) {
+                            plan.files.entry(file_path).or_default().push(fix);
+                        }
+                    }
+                    FixStrategy::AnnotationParamRewrite {
+                        ref old_param,
+                        ref new_param,
+                        ref value_transform,
+                    } => {
+                        if let Some(fix) = lang.plan_annotation_param_rewrite(
+                            rule_id,
+                            incident,
+                            old_param,
+                            new_param,
+                            value_transform,
+                            &file_path,
+                            report,
+                        ) {
+                            plan.files.entry(file_path).or_default().push(fix);
+                        }
+                    }
                     FixStrategy::CssVariablePrefix {
                         old_prefix,
                         new_prefix,
@@ -128,6 +168,50 @@ pub fn plan_fixes(
                             continue;
                         }
 
+                        // Check if applying this prefix swap would produce a
+                        // dead CSS class (one that doesn't exist in the target
+                        // version). This catches cases where a broad prefix rule
+                        // (e.g., pf-v5-c-expandable-section → pf-v6-c-expandable-section)
+                        // would incorrectly transform a substring of a dead class
+                        // (e.g., pf-v5-c-expandable-section__toggle → non-existent
+                        // pf-v6-c-expandable-section__toggle).
+                        //
+                        // Only check `would_produce.contains(dead)` (the result
+                        // contains a dead class as a substring). Do NOT check the
+                        // reverse (`dead.contains(would_produce)`) — that would
+                        // falsely suppress valid shorter classes when a longer dead
+                        // class happens to contain them as a prefix. For example,
+                        // `pf-v6-c-wizard__footer` is valid but would be suppressed
+                        // because dead class `pf-v6-c-wizard__footer-cancel`
+                        // contains it as a substring.
+                        if !dead_css_classes.is_empty() && !matched_text.is_empty() {
+                            let would_produce =
+                                matched_text.replace(old_prefix.as_str(), new_prefix.as_str());
+                            if dead_css_classes.iter().any(|dead| {
+                                would_produce.contains(dead.as_str())
+                            }) {
+                                tracing::debug!(
+                                    rule_id = %rule_id,
+                                    matched = %matched_text,
+                                    would_produce = %would_produce,
+                                    "Suppressing CssVariablePrefix — swap would produce dead class"
+                                );
+                                plan.manual.push(ManualFixItem {
+                                    rule_id: rule_id.clone(),
+                                    file_uri: incident.file_uri.clone(),
+                                    line: incident.line_number.unwrap_or(0),
+                                    message: format!(
+                                        "CSS class '{}' swap suppressed — '{}' does not exist in the target version. {}",
+                                        matched_text,
+                                        would_produce,
+                                        incident.message,
+                                    ),
+                                    code_snip: incident.code_snip.clone(),
+                                });
+                                continue;
+                            }
+                        }
+
                         // Treat CSS prefix changes as renames
                         let mappings = vec![RenameMapping {
                             old: old_prefix.clone(),
@@ -147,23 +231,76 @@ pub fn plan_fixes(
                     FixStrategy::EnsureDependency {
                         ref package,
                         ref new_version,
+                        ..
                     } => {
-                        // Delegate to the language provider for ecosystem-specific
-                        // dependency management (package.json, Cargo.toml, go.mod, etc.)
-                        // A single incident may produce multiple fixes (e.g., a lockfile
-                        // incident resolving multiple parent packages to update).
-                        let fixes = lang.plan_ensure_dependency(
-                            rule_id,
-                            incident,
-                            package,
-                            new_version,
-                            &file_path,
-                            report,
-                        );
-                        for fix in fixes {
-                            let dep_file = fix.file_uri.clone();
-                            let dep_path = uri_to_path(&dep_file, project_root);
-                            plan.files.entry(dep_path).or_default().push(fix);
+                        // Source file incidents (e.g., .tsx importing from the wrong
+                        // package) need an import rewrite, not just a manifest update.
+                        // Route them to the LLM path so goose can rewrite the import.
+                        // The manifest update still happens via plan_ensure_dependency
+                        // with the find_nearest_package_json fallback.
+                        let ext = file_path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("");
+                        // Java source files: skip EnsureDependency entirely.
+                        // The namespace migration handles imports via JavaImportRename;
+                        // the dependency update targets the manifest file, not .java files.
+                        if ext == "java" {
+                            continue;
+                        }
+                        if matches!(ext, "tsx" | "ts" | "jsx" | "js") {
+                            let mut enriched_message = incident.message.clone();
+                            if let (Some(imported), Some(module)) = (
+                                incident
+                                    .variables
+                                    .get("importedName")
+                                    .and_then(|v| v.as_str()),
+                                incident
+                                    .variables
+                                    .get("module")
+                                    .and_then(|v| v.as_str()),
+                            ) {
+                                enriched_message = format!(
+                                    "Import '{}' is from '{}' but needs to move to \
+                                     '{}' (version {}).\n\n\
+                                     Change the import source from '{}' to '{}'.\n\n{}",
+                                    imported,
+                                    module,
+                                    package,
+                                    new_version,
+                                    module,
+                                    package,
+                                    enriched_message,
+                                );
+                            }
+                            plan.pending_llm.push(LlmFixRequest {
+                                rule_id: rule_id.clone(),
+                                file_uri: incident.file_uri.clone(),
+                                file_path: file_path.clone(),
+                                line: incident.line_number.unwrap_or(0),
+                                message: enriched_message,
+                                code_snip: incident.code_snip.clone(),
+                                source: None,
+                                labels: vec![],
+                                companion_test_files: lang
+                                    .discover_companion_test_files(&file_path),
+                            });
+                        } else {
+                            // Manifest/lockfile incidents — delegate to language
+                            // provider for ecosystem-specific dependency management.
+                            let fixes = lang.plan_ensure_dependency(
+                                rule_id,
+                                incident,
+                                package,
+                                new_version,
+                                &file_path,
+                                report,
+                            );
+                            for fix in fixes {
+                                let dep_file = fix.file_uri.clone();
+                                let dep_path = uri_to_path(&dep_file, project_root);
+                                plan.files.entry(dep_path).or_default().push(fix);
+                            }
                         }
                     }
                     FixStrategy::Manual => {
@@ -176,6 +313,40 @@ pub fn plan_fixes(
                         });
                     }
                     FixStrategy::Llm { ref context } => {
+                        let companion_test_files =
+                            lang.discover_companion_test_files(&file_path);
+
+                        // If this is a test-impact-only violation and there are
+                        // no companion test files, skip the LLM session — there
+                        // is nothing actionable to fix.
+                        let is_test_impact_only = violation
+                            .labels
+                            .iter()
+                            .any(|l| l == "change-type=test-impact")
+                            && !violation.labels.iter().any(|l| {
+                                l.starts_with("change-type=")
+                                    && l != "change-type=test-impact"
+                            });
+
+                        if is_test_impact_only && companion_test_files.is_empty() {
+                            tracing::debug!(
+                                rule_id = %rule_id,
+                                file = %file_path.display(),
+                                "Skipping test-impact violation — no companion test files"
+                            );
+                            plan.manual.push(ManualFixItem {
+                                rule_id: rule_id.clone(),
+                                file_uri: incident.file_uri.clone(),
+                                line: incident.line_number.unwrap_or(0),
+                                message: format!(
+                                    "Test-impact violation with no companion test files found. {}",
+                                    incident.message,
+                                ),
+                                code_snip: incident.code_snip.clone(),
+                            });
+                            continue;
+                        }
+
                         let mut enriched_message = incident.message.clone();
 
                         // Append incident variables as structured context
@@ -205,8 +376,181 @@ pub fn plan_fixes(
                             code_snip: incident.code_snip.clone(),
                             source: None, // filled lazily if LLM is invoked
                             labels: violation.labels.clone(),
-                            companion_test_files: lang.discover_companion_test_files(&file_path),
+                            companion_test_files,
                         });
+                    }
+                }
+            }
+        }
+    }
+
+    // Proactive dependency updates: for EnsureDependency strategies that had
+    // zero matching incidents (e.g., because kantra doesn't dispatch dependency
+    // conditions to external providers), scan manifest files directly.
+    {
+        let used_dep_rule_ids: HashSet<String> = output
+            .iter()
+            .flat_map(|rs| rs.violations.keys())
+            .cloned()
+            .collect();
+
+        for (rule_id, strategy) in &strategies {
+            if let FixStrategy::EnsureDependency {
+                ref package,
+                ref new_version,
+                ref old_package,
+            } = strategy
+            {
+                // Only run proactively if: (a) no incidents matched this rule,
+                // and (b) we have an old_package to search for.
+                if used_dep_rule_ids.contains(rule_id.as_str()) {
+                    continue;
+                }
+                let old_pkg = match old_package {
+                    Some(p) if !p.is_empty() => p,
+                    _ => continue,
+                };
+
+                tracing::info!(
+                    rule_id = %rule_id,
+                    old_package = %old_pkg,
+                    new_package = %package,
+                    new_version = %new_version,
+                    "Running proactive dependency update (no kantra incidents)"
+                );
+
+                let fixes = lang.plan_proactive_dependency(
+                    rule_id, old_pkg, package, new_version, project_root, report,
+                );
+                for fix in fixes {
+                    let dep_path = uri_to_path(&fix.file_uri, project_root);
+                    plan.files.entry(dep_path).or_default().push(fix);
+                }
+            }
+        }
+    }
+
+    // Config file FQN replacement: for JavaImportRename strategies, scan
+    // non-Java config files (persistence.xml, build.gradle, *.properties,
+    // *.yml, Docker configs) for FQN references and replace them. This
+    // handles cases where class FQNs appear as string literals in config
+    // files that the Java scanner doesn't scan (e.g., dialect references
+    // like `org.hibernate.dialect.MySQL5InnoDBDialect`).
+    {
+        for (rule_id, strategy) in &strategies {
+            if let FixStrategy::JavaImportRename {
+                ref old_fqn,
+                ref new_fqn,
+            } = strategy
+            {
+                // Only scan config files for FQN-style patterns (must have at least
+                // 2 dots to avoid false positives from short patterns like "Criteria").
+                if old_fqn.matches('.').count() < 2 {
+                    continue;
+                }
+                let fixes = lang.plan_config_file_renames(
+                    rule_id, old_fqn, new_fqn, project_root, report,
+                );
+                for fix in fixes {
+                    let cfg_path = uri_to_path(&fix.file_uri, project_root);
+                    plan.files.entry(cfg_path).or_default().push(fix);
+                }
+            }
+        }
+    }
+
+    // Proactive import rename: for JavaImportRename strategies with no
+    // matching kantra incidents (e.g., companion dep import renames from
+    // the pipeline script), scan Java source files directly for the old
+    // import and apply the rename. This handles cases where the scanner
+    // rules didn't detect the import because the companion dep detection
+    // happens in the pipeline script, not the semver-analyzer.
+    {
+        let used_import_rule_ids: HashSet<String> = output
+            .iter()
+            .flat_map(|rs| rs.violations.keys())
+            .cloned()
+            .collect();
+
+        for (rule_id, strategy) in &strategies {
+            if let FixStrategy::JavaImportRename {
+                ref old_fqn,
+                ref new_fqn,
+            } = strategy
+            {
+                // Only run proactively if no kantra incidents matched this rule
+                if used_import_rule_ids.contains(rule_id.as_str()) {
+                    continue;
+                }
+                // Only for package-level renames (2+ dots)
+                if old_fqn.matches('.').count() < 2 {
+                    continue;
+                }
+
+                tracing::info!(
+                    rule_id = %rule_id,
+                    old_fqn = %old_fqn,
+                    new_fqn = %new_fqn,
+                    "Running proactive import rename (no kantra incidents)"
+                );
+
+                // Create a synthetic incident for the import rename planner
+                let incident = Incident {
+                    file_uri: String::new(),
+                    line_number: None,
+                    code_location: None,
+                    message: format!("Proactive import rename: {} → {}", old_fqn, new_fqn),
+                    code_snip: None,
+                    variables: std::collections::BTreeMap::new(),
+                    effort: None,
+                    links: Vec::new(),
+                    is_dependency_incident: false,
+                };
+
+                // Walk Java source files looking for the old import
+                let src_dir = project_root.join("src");
+                if src_dir.exists() {
+                    let mut dirs_to_visit = vec![src_dir];
+                    while let Some(dir) = dirs_to_visit.pop() {
+                        let entries = match std::fs::read_dir(&dir) {
+                            Ok(e) => e,
+                            Err(_) => continue,
+                        };
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                // Skip build/test output directories
+                                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                                if !matches!(name, "target" | "build" | ".gradle" | "node_modules") {
+                                    dirs_to_visit.push(path);
+                                }
+                                continue;
+                            }
+                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            if ext != "java" {
+                                continue;
+                            }
+
+                            // Quick check: does this file contain the old import?
+                            let content = match std::fs::read_to_string(&path) {
+                                Ok(s) => s,
+                                Err(_) => continue,
+                            };
+                            if !content.contains(old_fqn) {
+                                continue;
+                            }
+
+                            let file_path = path.to_path_buf();
+                            let mut inc = incident.clone();
+                            inc.file_uri = format!("file://{}", path.display());
+                            inc.line_number = Some(1);
+
+                            if let Some(fix) = lang.plan_import_rename(
+                                rule_id, &inc, old_fqn, new_fqn, &file_path, report,
+                            ) {
+                                plan.files.entry(file_path).or_default().push(fix);
+                            }
+                        }
                     }
                 }
             }
@@ -220,9 +564,21 @@ pub fn plan_fixes(
     // line has already been replaced.
     merge_dependency_inserts(&mut plan);
 
-    // Sort edits within each file by line number (descending) so we can apply bottom-up
+    // Sort edits within each file by line number (descending) so we can apply
+    // bottom-up, then by max old_text length (descending) within the same line
+    // so that more specific edits run before catch-all edits.  This matches the
+    // assumption in `deduplicate_edits()` that "the longer edit is applied first"
+    // when both edits use `replace_all`.  Without the secondary sort, a short
+    // catch-all edit can mutate the line before the specific edit, causing the
+    // specific edit's old_text to no longer match.
     for fixes in plan.files.values_mut() {
-        fixes.sort_by_key(|f| std::cmp::Reverse(f.line));
+        fixes.sort_by(|a, b| {
+            b.line.cmp(&a.line).then_with(|| {
+                let a_max = a.edits.iter().map(|e| e.old_text.len()).max().unwrap_or(0);
+                let b_max = b.edits.iter().map(|e| e.old_text.len()).max().unwrap_or(0);
+                b_max.cmp(&a_max)
+            })
+        });
     }
 
     // Deduplicate overlapping edits: when multiple edits target the same line
@@ -233,6 +589,163 @@ pub fn plan_fixes(
     deduplicate_edits(&mut plan);
 
     Ok(plan)
+}
+
+/// Merge `EnsureDependency` strategies that target the same npm package.
+///
+/// When multiple rule sets (e.g., react, patternfly, dynamic-plugin-sdk) each
+/// produce an `EnsureDependency` strategy for the same package (e.g., `react`)
+/// with different version ranges, the fix engine must pick a single version.
+///
+/// This function finds the **narrowest** range that is compatible with all
+/// other ranges for the same package. For example:
+///
+/// - React rules:       `^18.3.1`
+/// - PatternFly rules:  `^17 || ^18 || ^19`
+/// - SDK rules:         `^17 || ^18`
+///
+/// Result: `^18.3.1` (the narrowest range whose versions are accepted by all
+/// others). All strategies in the group are updated to use this range.
+///
+/// If no single range is a subset of all others (non-overlapping ranges), the
+/// most restrictive (fewest matching versions) is chosen and a warning is logged.
+fn merge_ensure_dependency_versions(
+    strategies: &BTreeMap<String, FixStrategy>,
+) -> BTreeMap<String, FixStrategy> {
+    let mut merged = strategies.clone();
+
+    // Group rule IDs by target package name
+    let mut pkg_groups: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for (rule_id, strategy) in &merged {
+        if let FixStrategy::EnsureDependency {
+            ref package,
+            ref new_version,
+            ..
+        } = strategy
+        {
+            pkg_groups
+                .entry(package.clone())
+                .or_default()
+                .push((rule_id.clone(), new_version.clone()));
+        }
+    }
+
+    for (package, entries) in &pkg_groups {
+        if entries.len() <= 1 {
+            continue;
+        }
+
+        // Deduplicate version ranges (multiple rules may specify the same range)
+        let unique_versions: Vec<&str> = {
+            let mut seen = HashSet::new();
+            entries
+                .iter()
+                .filter_map(|(_, v)| {
+                    if seen.insert(v.as_str()) {
+                        Some(v.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        if unique_versions.len() <= 1 {
+            // All rules agree on the same version — nothing to merge
+            continue;
+        }
+
+        // Parse all ranges; skip unparseable ones
+        let parsed: Vec<(&str, SemverRange)> = unique_versions
+            .iter()
+            .filter_map(|v| v.parse::<SemverRange>().ok().map(|r| (*v, r)))
+            .collect();
+
+        if parsed.len() < 2 {
+            continue;
+        }
+
+        // Find the narrowest range: one whose version set is a subset of all
+        // others. "A is narrower than B" means B.allows_all(&A) — every
+        // version matching A also matches B.
+        let narrowest = find_narrowest_range(&parsed);
+
+        let chosen = match narrowest {
+            Some(version_str) => version_str.to_string(),
+            None => {
+                // No single range is a subset of all others. This means the
+                // ranges are partially overlapping or disjoint. Pick the most
+                // restrictive range (fewest comparators as a rough heuristic)
+                // and warn.
+                let most_restrictive = parsed
+                    .iter()
+                    .min_by_key(|(v, _)| v.len())
+                    .map(|(v, _)| *v)
+                    .unwrap_or(unique_versions[0]);
+
+                tracing::warn!(
+                    package = %package,
+                    versions = ?unique_versions,
+                    chosen = %most_restrictive,
+                    "EnsureDependency conflict: no single range is compatible with all \
+                     others for package '{}'. Using most restrictive range. \
+                     This may produce incorrect results — verify manually.",
+                    package,
+                );
+                most_restrictive.to_string()
+            }
+        };
+
+        // Log the merge
+        let rule_ids: Vec<&str> = entries.iter().map(|(id, _)| id.as_str()).collect();
+        tracing::info!(
+            package = %package,
+            versions = ?unique_versions,
+            chosen = %chosen,
+            rules = ?rule_ids,
+            "Merged {} EnsureDependency strategies for '{}': {} -> {}",
+            entries.len(),
+            package,
+            unique_versions.join(", "),
+            chosen,
+        );
+
+        // Update all strategies in the group to use the chosen version
+        for (rule_id, _) in entries {
+            if let Some(FixStrategy::EnsureDependency {
+                ref mut new_version,
+                ..
+            }) = merged.get_mut(rule_id)
+            {
+                *new_version = chosen.clone();
+            }
+        }
+    }
+
+    merged
+}
+
+/// Find the narrowest semver range — one that is a subset of all others.
+///
+/// Returns `Some(version_str)` if a single range is found whose version set
+/// is accepted by every other range. Returns `None` if no such range exists
+/// (ranges are disjoint or partially overlapping).
+fn find_narrowest_range<'a>(parsed: &[(&'a str, SemverRange)]) -> Option<&'a str> {
+    'outer: for (i, (candidate_str, candidate_range)) in parsed.iter().enumerate() {
+        // Check if every OTHER range accepts all versions that this candidate accepts.
+        // That means: for each other range R, R.allows_all(candidate) must be true.
+        for (j, (_, other_range)) in parsed.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            if !other_range.allows_all(candidate_range) {
+                continue 'outer;
+            }
+        }
+        // candidate is a subset of all others — it's the narrowest
+        return Some(candidate_str);
+    }
+    None
 }
 
 /// Remove edits that are subsumed by a more specific edit on the same line.
@@ -481,6 +994,63 @@ fn deduplicate_edits(plan: &mut FixPlan) {
 
 /// Consolidate LLM fix requests by component family when a family-level
 /// strategy exists. Multiple rules targeting the same `(file, family)` are
+/// Connect cross-package `EnsureDependency` LLM requests to family entries
+/// from the target package's analysis.
+///
+/// When the semver-analyzer runs against multiple packages (e.g., `react-core`
+/// and `react-drag-drop`), each strategy entry carries a `source_package` field
+/// identifying which package's analysis produced it. An `EnsureDependency` rule
+/// from `react-core` may point to `react-drag-drop` as the target package, and
+/// a `family:DragDrop` entry from the `react-drag-drop` analysis has
+/// `source_package = "@patternfly/react-drag-drop"`.
+///
+/// This function bridges the gap: for each pending LLM request originating from
+/// an `EnsureDependency` rule, it checks if the target package matches any
+/// family entry's `source_package`. If so, it adds a `family=FamilyName` label
+/// to the request so that [`consolidate_family_requests`] can later pull in the
+/// full family migration context (target structure, prop mappings, etc.).
+pub fn enrich_cross_package_requests(
+    requests: &mut [LlmFixRequest],
+    strategies: &BTreeMap<String, FixStrategy>,
+    family_entries: &BTreeMap<String, FixStrategyEntry>,
+) {
+    if family_entries.is_empty() {
+        return;
+    }
+
+    // Build index: source_package -> family name (e.g., "@patternfly/react-drag-drop" -> "DragDrop").
+    let mut package_to_family: HashMap<String, String> = HashMap::new();
+    for (key, entry) in family_entries {
+        if let Some(ref src_pkg) = entry.source_package {
+            if let Some(family_name) = key.strip_prefix("family:") {
+                package_to_family
+                    .entry(src_pkg.clone())
+                    .or_insert_with(|| family_name.to_string());
+            }
+        }
+    }
+
+    if package_to_family.is_empty() {
+        return;
+    }
+
+    for req in requests.iter_mut() {
+        // Skip requests that already have a family label.
+        if req.labels.iter().any(|l| l.starts_with("family=")) {
+            continue;
+        }
+
+        // Check if this request's rule is an EnsureDependency.
+        if let Some(FixStrategy::EnsureDependency { ref package, .. }) =
+            strategies.get(&req.rule_id)
+        {
+            if let Some(family_name) = package_to_family.get(package) {
+                req.labels.push(format!("family={}", family_name));
+            }
+        }
+    }
+}
+
 /// merged into a single request with a unified message containing the target
 /// component structure and all incident variables.
 ///
@@ -540,7 +1110,8 @@ pub fn consolidate_family_requests(
 
         if let Some(ref target) = entry.target_structure {
             message.push_str(&format!(
-                "\nTarget structure (correct v6 composition):\n```jsx\n{}\n```\n",
+                "\nReference: v6 component API (DO NOT restructure code to match this — \
+                 only make changes described by the incidents below):\n```jsx\n{}\n```\n",
                 target
             ));
         }
@@ -639,6 +1210,15 @@ pub fn consolidate_family_requests(
                             "  {} -> {} (renamed, type unchanged)\n",
                             p.old_name, p.new_name
                         ));
+                    } else {
+                        // Same name, same type — still show it so the LLM
+                        // knows this prop carries over from the deprecated
+                        // component unchanged.
+                        let typ = p.new_type.as_deref().unwrap_or("?");
+                        message.push_str(&format!(
+                            "  {}: {} (unchanged)\n",
+                            p.new_name, typ
+                        ));
                     }
                 }
             }
@@ -653,6 +1233,12 @@ pub fn consolidate_family_requests(
                     "Removed props (no replacement equivalent): {}\n",
                     dm.removed_props.join(", ")
                 ));
+            }
+            if !dm.appearance_notes.is_empty() {
+                message.push_str("Appearance/variant notes:\n");
+                for note in &dm.appearance_notes {
+                    message.push_str(&format!("  IMPORTANT: {}\n", note));
+                }
             }
         }
 
@@ -835,14 +1421,8 @@ pub fn generate_test_fix_requests(requests: &[LlmFixRequest]) -> Vec<LlmFixReque
                  Instructions:\n\
                  1. Read this test file at {test_path}\n\
                  2. Read the component file at {component_path} to see the current (already migrated) code\n\
-                 3. For each test that interacts with the migrated component:\n\
-                    - If the test opens a dropdown/menu/popover and queries for content using \
-                      getByText/getByRole/findByText: the content now renders via portal to \
-                      document.body. Wrap assertions in waitFor() or add \
-                      popperProps={{{{ appendTo: 'inline' }}}} to the component render in the test.\n\
-                    - If the test uses querySelector with data attributes that changed \
-                      (e.g., OUIA selectors with PF5 prefix): update to the new attribute values.\n\
-                    - If the test uses getByRole with roles that changed: update the role queries.\n\
+                 3. For each test that interacts with the migrated component, check whether \
+                    the changes described above would cause the test to fail. If so, fix the test.\n\
                  4. Write the fixed test file",
                 component_file = component_file_name,
                 original_message = req.message,
@@ -876,6 +1456,43 @@ pub fn generate_test_fix_requests(requests: &[LlmFixRequest]) -> Vec<LlmFixReque
     }
 
     test_requests
+}
+
+/// Collect CSS class texts from violations labeled `change-type=css-dead-class`.
+///
+/// These are CSS classes where a naive version prefix swap (e.g.,
+/// `pf-v5-c-expandable-section__toggle` → `pf-v6-c-expandable-section__toggle`)
+/// produces a class that does NOT exist in the target CSS distribution.
+/// Used to suppress `CssVariablePrefix` edits that would create broken references.
+fn collect_dead_css_classes(output: &[RuleSet]) -> std::collections::HashSet<String> {
+    let mut dead = std::collections::HashSet::new();
+    for rs in output {
+        for violation in rs.violations.values() {
+            let is_dead = violation
+                .labels
+                .iter()
+                .any(|l| l == "change-type=css-dead-class");
+            if !is_dead {
+                continue;
+            }
+            for inc in &violation.incidents {
+                // Collect the matched text or class name from the incident.
+                // The dead-class rules may use either variable depending on
+                // whether the scanner matched a className or a matchingText.
+                if let Some(mt) = inc
+                    .variables
+                    .get("matchingText")
+                    .and_then(|v| v.as_str())
+                {
+                    dead.insert(mt.to_string());
+                }
+                if let Some(cn) = inc.variables.get("className").and_then(|v| v.as_str()) {
+                    dead.insert(cn.to_string());
+                }
+            }
+        }
+    }
+    dead
 }
 
 /// Apply a fix plan to disk.
@@ -1034,7 +1651,7 @@ pub fn preview_fixes(plan: &FixPlan, lang: &dyn LanguageFixProvider) -> Result<S
         }
 
         for (_, line_content) in changed_lines.iter_mut() {
-            let mut single = [line_content.clone()];
+            let mut single = vec![line_content.clone()];
             lang.post_process_lines(&mut single);
             *line_content = single.into_iter().next().unwrap();
         }
@@ -1182,20 +1799,34 @@ fn plan_rename(
                 }
             }
         }
-    } else if let Some(file_line) = source.lines().nth((line as usize).saturating_sub(1)) {
-        for m in mappings {
-            if m.old == m.new {
-                continue;
-            }
-            if file_line.contains(&m.old) {
-                edits.push(TextEdit {
-                    line,
-                    old_text: m.old.clone(),
-                    new_text: m.new.clone(),
-                    rule_id: rule_id.to_string(),
-                    description: format!("Rename '{}' to '{}'", m.old, m.new),
-                    replace_all: false,
-                });
+    } else {
+        // Fallback: scan a window around the incident line. The reported line
+        // may be slightly off (e.g., scanner reports the start of a multi-line
+        // template literal, but the match is a few lines later).
+        let line_idx = (line as usize).saturating_sub(1);
+        let scan_start = line_idx.saturating_sub(1);
+        let scan_end = (line_idx + 5).min(source.lines().count());
+        for (idx, file_line) in source
+            .lines()
+            .enumerate()
+            .skip(scan_start)
+            .take(scan_end - scan_start)
+        {
+            let line_num = (idx + 1) as u32;
+            for m in mappings {
+                if m.old == m.new {
+                    continue;
+                }
+                if file_line.contains(&m.old) {
+                    edits.push(TextEdit {
+                        line: line_num,
+                        old_text: m.old.clone(),
+                        new_text: m.new.clone(),
+                        rule_id: rule_id.to_string(),
+                        description: format!("Rename '{}' to '{}'", m.old, m.new),
+                        replace_all: false,
+                    });
+                }
             }
         }
     }
@@ -1986,5 +2617,286 @@ export {
             .collect();
         assert_eq!(edits.len(), 1, "Exact duplicate should be removed");
         assert_eq!(plan.edits_subsumed, 1);
+    }
+
+    // ── apply_fixes ordering tests ──────────────────────────────────
+
+    #[test]
+    fn test_apply_fixes_specific_before_catchall_on_same_line() {
+        // TC081 scenario: a specific CSS variable rename and a catch-all
+        // prefix rename both target the same line.  The specific rule has
+        // a longer `old_text` and should run first so the catch-all doesn't
+        // clobber it.
+        //
+        // Without longest-first ordering within a line, the catch-all may
+        // run first, mutating the line so the specific rule can't find its
+        // `old_text` anymore.
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let css_file = dir.path().join("test.css");
+        {
+            let mut f = std::fs::File::create(&css_file).expect("create file");
+            writeln!(f, ".custom-element {{").unwrap();
+            writeln!(f, "  padding: var(--pf-v5-global--spacer--md);").unwrap();
+            writeln!(f, "}}").unwrap();
+        }
+
+        let mut plan = FixPlan::default();
+        // Insert catch-all FIRST to simulate the worst-case ordering
+        plan.files.insert(
+            css_file.clone(),
+            vec![
+                make_edit(2, "--pf-v5-global--", "--pf-t--global--", true),
+                make_edit(2, "--pf-v5-global--spacer--md", "--pf-t--global--spacer--300", true),
+            ],
+        );
+
+        // Run the same sort + dedup that plan_fixes performs
+        for fixes in plan.files.values_mut() {
+            fixes.sort_by(|a, b| {
+                b.line.cmp(&a.line).then_with(|| {
+                    let a_max = a.edits.iter().map(|e| e.old_text.len()).max().unwrap_or(0);
+                    let b_max = b.edits.iter().map(|e| e.old_text.len()).max().unwrap_or(0);
+                    b_max.cmp(&a_max)
+                })
+            });
+        }
+        deduplicate_edits(&mut plan);
+
+        let noop = crate::language::NoOpLanguageFixProvider;
+        let result = apply_fixes(&plan, &noop, dir.path()).expect("apply_fixes");
+
+        let output = std::fs::read_to_string(&css_file).expect("read result");
+        assert!(
+            output.contains("--pf-t--global--spacer--300"),
+            "Specific rename should have won. Got: {}",
+            output,
+        );
+        assert!(
+            !output.contains("--pf-v5-global--"),
+            "No v5 prefixes should remain. Got: {}",
+            output,
+        );
+        // The specific edit runs first (succeeds), the catch-all runs second
+        // (old_text not found → failed but harmless).
+        assert!(
+            result.edits_applied >= 1,
+            "At least the specific edit should succeed"
+        );
+    }
+
+    // ── merge_ensure_dependency_versions tests ──────────────────────
+
+    #[test]
+    fn test_merge_deps_single_package_picks_narrowest() {
+        // Three rules target "react" with different ranges.
+        // ^18.3.1 is narrower than ^18 || ^19 and ^17 || ^18 || ^19.
+        let mut strategies = BTreeMap::new();
+        strategies.insert(
+            "rule-react".to_string(),
+            FixStrategy::EnsureDependency {
+                package: "react".to_string(),
+                new_version: "^18.3.1".to_string(),
+                old_package: None,
+            },
+        );
+        strategies.insert(
+            "rule-sdk".to_string(),
+            FixStrategy::EnsureDependency {
+                package: "react".to_string(),
+                new_version: "^18 || ^19".to_string(),
+                old_package: None,
+            },
+        );
+        strategies.insert(
+            "rule-pf".to_string(),
+            FixStrategy::EnsureDependency {
+                package: "react".to_string(),
+                new_version: "^17 || ^18 || ^19".to_string(),
+                old_package: None,
+            },
+        );
+
+        let merged = merge_ensure_dependency_versions(&strategies);
+
+        // All three should now have ^18.3.1 (the narrowest)
+        for rule_id in &["rule-react", "rule-sdk", "rule-pf"] {
+            if let FixStrategy::EnsureDependency { new_version, .. } =
+                merged.get(*rule_id).unwrap()
+            {
+                assert_eq!(
+                    new_version, "^18.3.1",
+                    "Rule '{}' should be merged to ^18.3.1",
+                    rule_id
+                );
+            } else {
+                panic!("Strategy for '{}' should be EnsureDependency", rule_id);
+            }
+        }
+    }
+
+    #[test]
+    fn test_merge_deps_no_conflict() {
+        // Two rules target different packages — no merging needed
+        let mut strategies = BTreeMap::new();
+        strategies.insert(
+            "rule-react".to_string(),
+            FixStrategy::EnsureDependency {
+                package: "react".to_string(),
+                new_version: "^18.3.1".to_string(),
+                old_package: None,
+            },
+        );
+        strategies.insert(
+            "rule-lodash".to_string(),
+            FixStrategy::EnsureDependency {
+                package: "lodash".to_string(),
+                new_version: "^4.17.21".to_string(),
+                old_package: None,
+            },
+        );
+
+        let merged = merge_ensure_dependency_versions(&strategies);
+
+        if let FixStrategy::EnsureDependency { new_version, .. } =
+            merged.get("rule-react").unwrap()
+        {
+            assert_eq!(new_version, "^18.3.1");
+        }
+        if let FixStrategy::EnsureDependency { new_version, .. } =
+            merged.get("rule-lodash").unwrap()
+        {
+            assert_eq!(new_version, "^4.17.21");
+        }
+    }
+
+    #[test]
+    fn test_merge_deps_identical_versions() {
+        // Two rules target the same package with the same version — no change
+        let mut strategies = BTreeMap::new();
+        strategies.insert(
+            "rule-a".to_string(),
+            FixStrategy::EnsureDependency {
+                package: "react".to_string(),
+                new_version: "^18.3.1".to_string(),
+                old_package: None,
+            },
+        );
+        strategies.insert(
+            "rule-b".to_string(),
+            FixStrategy::EnsureDependency {
+                package: "react".to_string(),
+                new_version: "^18.3.1".to_string(),
+                old_package: None,
+            },
+        );
+
+        let merged = merge_ensure_dependency_versions(&strategies);
+
+        for rule_id in &["rule-a", "rule-b"] {
+            if let FixStrategy::EnsureDependency { new_version, .. } =
+                merged.get(*rule_id).unwrap()
+            {
+                assert_eq!(new_version, "^18.3.1");
+            }
+        }
+    }
+
+    #[test]
+    fn test_merge_deps_disjoint_ranges() {
+        // Two rules with disjoint ranges: ^16 and ^18. No subset exists.
+        // Should pick the most restrictive and warn.
+        let mut strategies = BTreeMap::new();
+        strategies.insert(
+            "rule-old".to_string(),
+            FixStrategy::EnsureDependency {
+                package: "react".to_string(),
+                new_version: "^16.0.0".to_string(),
+                old_package: None,
+            },
+        );
+        strategies.insert(
+            "rule-new".to_string(),
+            FixStrategy::EnsureDependency {
+                package: "react".to_string(),
+                new_version: "^18.3.1".to_string(),
+                old_package: None,
+            },
+        );
+
+        let merged = merge_ensure_dependency_versions(&strategies);
+
+        // Both should have the same version (whichever was picked)
+        let v1 = if let FixStrategy::EnsureDependency { new_version, .. } =
+            merged.get("rule-old").unwrap()
+        {
+            new_version.clone()
+        } else {
+            panic!()
+        };
+        let v2 = if let FixStrategy::EnsureDependency { new_version, .. } =
+            merged.get("rule-new").unwrap()
+        {
+            new_version.clone()
+        } else {
+            panic!()
+        };
+        assert_eq!(v1, v2, "Disjoint ranges should converge to a single version");
+    }
+
+    #[test]
+    fn test_merge_deps_or_range_with_caret() {
+        // ^17 || ^18 and ^17.0.1 — caret range ^17.0.1 is narrower
+        let mut strategies = BTreeMap::new();
+        strategies.insert(
+            "rule-sdk".to_string(),
+            FixStrategy::EnsureDependency {
+                package: "react".to_string(),
+                new_version: "^17 || ^18".to_string(),
+                old_package: None,
+            },
+        );
+        strategies.insert(
+            "rule-console".to_string(),
+            FixStrategy::EnsureDependency {
+                package: "react".to_string(),
+                new_version: "^17.0.1".to_string(),
+                old_package: None,
+            },
+        );
+
+        let merged = merge_ensure_dependency_versions(&strategies);
+
+        for rule_id in &["rule-sdk", "rule-console"] {
+            if let FixStrategy::EnsureDependency { new_version, .. } =
+                merged.get(*rule_id).unwrap()
+            {
+                assert_eq!(
+                    new_version, "^17.0.1",
+                    "Rule '{}' should be merged to ^17.0.1 (narrowest)",
+                    rule_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_find_narrowest_range_basic() {
+        let ranges: Vec<(&str, SemverRange)> = vec![
+            ("^18.3.1", "^18.3.1".parse().unwrap()),
+            ("^18 || ^19", "^18 || ^19".parse().unwrap()),
+            ("^17 || ^18 || ^19", "^17 || ^18 || ^19".parse().unwrap()),
+        ];
+        assert_eq!(find_narrowest_range(&ranges), Some("^18.3.1"));
+    }
+
+    #[test]
+    fn test_find_narrowest_range_disjoint() {
+        let ranges: Vec<(&str, SemverRange)> = vec![
+            ("^16.0.0", "^16.0.0".parse().unwrap()),
+            ("^18.0.0", "^18.0.0".parse().unwrap()),
+        ];
+        assert_eq!(find_narrowest_range(&ranges), None);
     }
 }
