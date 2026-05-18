@@ -323,6 +323,105 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
         plan.pending_llm.extend(test_fix_requests);
     }
 
+    // ── Promote co-located pattern fixes to LLM ────────────────────
+    //
+    // When a deterministic pattern fix and an LLM fix target the same
+    // (file, line), the pattern fix would modify the line first, causing
+    // the stale-violation filter to incorrectly drop the LLM fix (the
+    // code snippet no longer matches the post-edit line).  Instead,
+    // promote the pattern fix into pending_llm so the LLM handles both
+    // changes in one coherent pass.
+    //
+    // Only promote a PlannedFix when ALL of its edits co-locate with an
+    // LLM violation; if some edits are on unrelated lines, keep the
+    // entire fix as a deterministic pattern fix.
+    let llm_locations: HashSet<(PathBuf, u32)> = plan
+        .pending_llm
+        .iter()
+        .map(|req| (req.file_path.clone(), req.line))
+        .collect();
+
+    // Track locations where a prop-moved rule already describes the
+    // removal + migration destination. When a RemoveProp pattern fix
+    // co-locates with a prop-moved LLM rule, the pattern fix is strictly
+    // redundant — the prop-moved rule already tells the LLM that the
+    // prop was removed AND where it moved to. Promoting the RemoveProp
+    // would add a conflicting "just remove it" message that causes the
+    // LLM to drop the prop value instead of moving it.
+    let prop_moved_locations: HashSet<(PathBuf, u32)> = plan
+        .pending_llm
+        .iter()
+        .filter(|req| {
+            req.labels
+                .iter()
+                .any(|l| l == "change-type=prop-moved")
+                || req.rule_id.starts_with("sd-prop-moved-")
+        })
+        .map(|req| (req.file_path.clone(), req.line))
+        .collect();
+
+    let mut promoted = Vec::new();
+    let mut subsumed_count = 0usize;
+    for (file_path, fixes) in plan.files.iter_mut() {
+        let mut i = 0;
+        while i < fixes.len() {
+            let all_colocated = fixes[i]
+                .edits
+                .iter()
+                .all(|edit| llm_locations.contains(&(file_path.clone(), edit.line)));
+
+            if all_colocated {
+                // Check if a prop-moved rule already covers this location.
+                // If so, drop the pattern fix entirely — the prop-moved
+                // rule is strictly more informative (removal + destination).
+                if prop_moved_locations.contains(&(file_path.clone(), fixes[i].line)) {
+                    tracing::debug!(
+                        rule_id = %fixes[i].rule_id,
+                        file = %file_path.display(),
+                        line = fixes[i].line,
+                        "Dropping pattern fix subsumed by prop-moved rule"
+                    );
+                    fixes.remove(i);
+                    subsumed_count += 1;
+                } else {
+                    let fix = fixes.remove(i);
+                    promoted.push(fix_engine_core::LlmFixRequest {
+                        rule_id: fix.rule_id.clone(),
+                        file_uri: fix.file_uri.clone(),
+                        file_path: file_path.clone(),
+                        line: fix.line,
+                        message: fix.description.clone(),
+                        code_snip: None,
+                        source: None,
+                        labels: vec![],
+                        companion_test_files: vec![],
+                    });
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    plan.files.retain(|_, fixes| !fixes.is_empty());
+    let promoted_count = promoted.len();
+    plan.pending_llm.extend(promoted);
+    if promoted_count > 0 || subsumed_count > 0 {
+        if promoted_count > 0 {
+            progress.println(&format!(
+                "  {} Promoted {} co-located pattern fix(es) to LLM phase",
+                "info:".cyan().bold(),
+                promoted_count,
+            ));
+        }
+        if subsumed_count > 0 {
+            progress.println(&format!(
+                "  {} Dropped {} pattern fix(es) subsumed by prop-moved rules",
+                "info:".cyan().bold(),
+                subsumed_count,
+            ));
+        }
+    }
+
     let pattern_fix_count: usize = plan
         .files
         .values()

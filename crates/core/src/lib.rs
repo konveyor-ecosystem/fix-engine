@@ -1086,4 +1086,47 @@ mod tests {
             "Short snippet text → assume fresh"
         );
     }
+
+    /// Demonstrates the false positive in `is_violation_fresh` when a
+    /// pattern fix for one rule modifies the same line that an LLM
+    /// violation targets for a different rule.
+    ///
+    /// In this scenario the absorbing-prop rule fires on line 8
+    /// (`<NavItem to="#" hasNavLinkWrapper>`).  A separate RemoveProp
+    /// pattern fix removes `hasNavLinkWrapper`, changing line 8 to
+    /// `<NavItem to="#">`.  The stale-violation filter then sees that
+    /// line 8's text no longer matches and incorrectly drops the
+    /// absorbing-prop LLM request.
+    ///
+    /// The fix for this is in `fix.rs`: co-located pattern fixes are
+    /// promoted to `pending_llm` so the line is never modified before
+    /// the stale check runs.
+    #[test]
+    fn test_violation_appears_stale_when_different_fix_modifies_same_line() {
+        let snip = "    7      <NavList>\n\
+                        8        <NavItem to=\"#\" hasNavLinkWrapper>\n\
+                        9          <HomeIcon /> Home";
+        // After a RemoveProp pattern fix removed hasNavLinkWrapper from line 8
+        let content = "import React from 'react';\n\
+                       import { Nav, NavItem, NavList } from '@patternfly/react-core';\n\
+                       import { HomeIcon } from '@patternfly/react-icons';\n\
+                       \n\
+                       const App = () => (\n\
+                         <Nav>\n\
+                           <NavList>\n\
+                             <NavItem to=\"#\">\n\
+                               <HomeIcon /> Home\n\
+                             </NavItem>\n\
+                           </NavList>\n\
+                         </Nav>\n\
+                       );";
+        // is_violation_fresh returns false because the exact line text
+        // changed — even though the NavItem component is still present
+        // and the absorbing-prop violation is still relevant.
+        assert!(
+            !is_violation_fresh(Some(snip), 8, content),
+            "Demonstrates false positive: line was modified by a different fix, \
+             not because this violation was resolved"
+        );
+    }
 }
